@@ -6,7 +6,7 @@ import concurrent.futures
 from datetime import datetime
 import plotly.graph_objects as go
 import logging
-import FinanceDataReader as fdr  # [추가] 한국 주식 데이터 전문 라이브러리
+import FinanceDataReader as fdr
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -33,20 +33,17 @@ def get_vix():
     try: return yf.Ticker("^KS200VIX").history(period="1d")['Close'].iloc[-1]
     except: return 20.0
 
-# --- [★ 핵심: 전 종목 자동 수집 및 분류 함수] ---
-@st.cache_data(ttl=3600*12)  # 12시간마다 갱신 (장 시작 전 한 번이면 충분)
+# --- [★ 핵심 수정: 안전한 데이터 로딩 함수] ---
+@st.cache_data(ttl=3600*12)
 def load_market_data():
-    # 1. KOSPI, KOSDAQ 전 종목 리스트 가져오기 (Marcap: 시가총액)
-    df_kospi = fdr.StockListing('KOSPI')
-    df_kosdaq = fdr.StockListing('KOSDAQ')
+    # 1. KRX 전체 종목 가져오기 (가장 데이터가 온전함)
+    df = fdr.StockListing('KRX')
     
-    # 2. 시가총액 상위 필터링 (우선주 제외 패턴 등은 간단히 처리)
-    df_kospi = df_kospi.sort_values(by='Marcap', ascending=False).head(200)
-    df_kosdaq = df_kosdaq.sort_values(by='Marcap', ascending=False).head(100)
+    # 2. 시가총액(Marcap) 순으로 정렬하여 상위 300개 추출
+    # (데이터프레임 컬럼명이 Marcap이 아닐 경우를 대비해 안전장치 추가)
+    sort_col = 'Marcap' if 'Marcap' in df.columns else 'Close' # 시총 없으면 가격순(임시)
+    df = df.sort_values(by=sort_col, ascending=False).head(300)
     
-    combined_df = pd.concat([df_kospi, df_kosdaq])
-    
-    # 3. 섹터 자동 분류 로직 (Keyword matching)
     sectors = {
         "🚀 반도체 & IT": [],
         "🔋 2차전지 & 화학": [],
@@ -59,51 +56,61 @@ def load_market_data():
         "🌈 기타 대형주": []
     }
     
-    # 티커 맵핑용 딕셔너리 생성
     ticker_name_map = {}
 
-    for _, row in combined_df.iterrows():
-        code = row['Code']
-        name = row['Name']
-        sector = str(row['Sector']) if pd.notnull(row['Sector']) else ""
-        industry = str(row['Industry']) if pd.notnull(row['Industry']) else ""
+    # 컬럼 존재 여부 미리 확인 (KeyError 방지)
+    has_sector = 'Sector' in df.columns
+    has_industry = 'Industry' in df.columns
+    has_market = 'Market' in df.columns
+
+    for _, row in df.iterrows():
+        code = str(row['Code'])
+        name = str(row['Name'])
         
-        # 야후 파이낸스용 티커 변환 (.KS / .KQ)
-        # FinanceDataReader는 숫자만 주므로 접미사 붙여야 함
-        # (간단한 로직: 코스피 리스트에 있으면 KS, 아니면 KQ)
-        suffix = ".KS" if code in df_kospi['Code'].values else ".KQ"
+        # 시장 구분 (KS/KQ)
+        market_type = row['Market'] if has_market else 'KOSPI' # 기본값
+        
+        if market_type == 'KOSPI': suffix = ".KS"
+        elif market_type == 'KOSDAQ': suffix = ".KQ"
+        else: continue # 코넥스 등은 제외
+
         yf_ticker = code + suffix
         ticker_name_map[yf_ticker] = name
         
-        # 키워드 기반 분류
-        combined_text = (name + sector + industry).lower()
+        # 섹터/산업 정보 안전하게 가져오기 (없으면 빈 문자열)
+        sector_str = str(row['Sector']) if has_sector and pd.notnull(row['Sector']) else ""
+        industry_str = str(row['Industry']) if has_industry and pd.notnull(row['Industry']) else ""
         
-        if any(x in combined_text for x in ['반도체', '전자', '디스플레이', 'sk하이닉스', 'hpsp', '리노']):
+        # 키워드 매칭을 위한 텍스트 통합
+        combined_text = (name + " " + sector_str + " " + industry_str).lower()
+        
+        # 분류 로직
+        if any(x in combined_text for x in ['반도체', '전자', '디스플레이', 'sk하이닉스', 'hpsp', '리노', '이수페타시스', '가온칩스']):
             sectors["🚀 반도체 & IT"].append(yf_ticker)
-        elif any(x in combined_text for x in ['전지', '화학', '에너지', '에코프로', '포스코퓨처', '금양']):
+        elif any(x in combined_text for x in ['전지', '화학', '에너지', '에코프로', '포스코퓨처', '금양', '엘앤에프']):
             sectors["🔋 2차전지 & 화학"].append(yf_ticker)
-        elif any(x in combined_text for x in ['제약', '바이오', '생명', '헬스', '알테오젠', 'hlb', '셀트리온']):
+        elif any(x in combined_text for x in ['제약', '바이오', '생명', '헬스', '알테오젠', 'hlb', '셀트리온', '삼천당']):
             sectors["💊 제약 & 바이오"].append(yf_ticker)
-        elif any(x in combined_text for x in ['금융', '지주', '은행', '증권', '보험', '메리츠']):
+        elif any(x in combined_text for x in ['금융', '지주', '은행', '증권', '보험', '메리츠', '기업은행']):
             sectors["💰 금융 (지주/증권/은행)"].append(yf_ticker)
-        elif any(x in combined_text for x in ['자동차', '부품', '에어', '항공', '해운', '글로비스', '기아', '현대차']):
+        elif any(x in combined_text for x in ['자동차', '부품', '에어', '항공', '해운', '글로비스', '기아', '현대차', '모비스']):
             sectors["🚗 자동차 & 운송"].append(yf_ticker)
-        elif any(x in combined_text for x in ['중공업', '방산', '기계', '전력', '전선', '건설', '조선', '한화', '현대일렉']):
+        elif any(x in combined_text for x in ['중공업', '방산', '기계', '전력', '전선', '건설', '조선', '한화', '현대일렉', '로템']):
             sectors["🛡️ 방산/조선/전력/건설"].append(yf_ticker)
-        elif any(x in combined_text for x in ['식품', '음료', '화장품', '엔터', '투어', '쇼핑', 'f&b', '하이브', '푸드']):
+        elif any(x in combined_text for x in ['식품', '음료', '화장품', '엔터', '투어', '쇼핑', 'f&b', '하이브', '푸드', '아모레', 'cj']):
             sectors["💄 소비재 (화장품/식품/엔터)"].append(yf_ticker)
-        elif any(x in combined_text for x in ['소프트웨어', '게임', '통신', '서비스', '인터넷', '네이버', '카카오', '크래프톤']):
+        elif any(x in combined_text for x in ['소프트웨어', '게임', '통신', '서비스', '인터넷', '네이버', '카카오', '크래프톤', '텔레콤']):
             sectors["🎮 플랫폼 & 게임 & 통신"].append(yf_ticker)
         else:
             sectors["🌈 기타 대형주"].append(yf_ticker)
 
     return sectors, ticker_name_map
 
-# --- [데이터 로딩 (앱 시작 시 최초 1회 실행)] ---
-with st.spinner("최신 시가총액 상위 300개 종목을 불러오는 중입니다..."):
+# --- [데이터 로딩] ---
+with st.spinner("최신 시가총액 상위 종목을 분석하여 불러오는 중입니다... (10~20초 소요)"):
     SECTORS, TICKER_MAP = load_market_data()
 
-# --- [보조지표 및 점수 함수 (동일)] ---
+# --- [보조지표 및 분석 함수들 (기존 유지)] ---
 def get_stock_name(ticker):
     return TICKER_MAP.get(ticker, ticker)
 
@@ -130,10 +137,11 @@ def calculate_indicators(hist):
     ema26 = hist['Close'].ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     signal_line = macd.ewm(span=9, adjust=False).mean()
-    # Bollinger Bands
+    # BB
     sma20 = hist['Close'].rolling(window=20).mean()
     std20 = hist['Close'].rolling(window=20).std()
     upper_band = sma20 + (std20 * 2)
+    lower_band = sma20 - (std20 * 2)
     # SMA
     sma120 = hist['Close'].rolling(window=120).mean()
     sma50 = hist['Close'].rolling(window=50).mean()
@@ -168,10 +176,10 @@ def fetch_stock_data(ticker):
         
         cur_macd, cur_signal = macd.iloc[-1], signal_line.iloc[-1]
         cur_upper = upper_band.iloc[-1]
-        cur_sma120, cur_sma50 = sma120.iloc[-1], sma50.iloc[-1]
-        cur_sma20, cur_sma5 = sma20.iloc[-1], sma5.iloc[-1]
-        prev_sma50 = sma50.iloc[-2]
-        prev_sma5, prev_sma20 = sma5.iloc[-2], sma20.iloc[-2]
+        cur_sma120 = sma120.iloc[-1]
+        cur_sma50, prev_sma50 = sma50.iloc[-1], sma50.iloc[-2]
+        cur_sma20, prev_sma20 = sma20.iloc[-1], sma20.iloc[-2]
+        cur_sma5, prev_sma5 = sma5.iloc[-1], sma5.iloc[-2]
         cur_cci = cci.iloc[-1]
 
         score = 0
@@ -181,7 +189,7 @@ def fetch_stock_data(ticker):
         if cur_price >= cur_sma120: score += 20; reasons.append("장기정배열")
         else: score -= 10
         
-        # 2. 골든크로스 (단기 & 중기)
+        # 2. 골든크로스
         is_short_gc = (prev_sma5 < prev_sma20) and (cur_sma5 >= cur_sma20)
         if is_short_gc: score += 20; reasons.append("단기골든크로스")
         elif cur_sma5 > cur_sma20: score += 10
@@ -194,7 +202,7 @@ def fetch_stock_data(ticker):
         if cur_macd > cur_signal: score += 10
         if cur_cci < -100: score += 10; reasons.append("CCI침체")
         
-        # 4. RSI (과열/침체)
+        # 4. RSI
         if rsi <= 35: score += 15; reasons.append("RSI과매도")
         elif 40 <= rsi <= 65: score += 5
         elif rsi >= 75: score -= 15; reasons.append("RSI과열")
@@ -234,16 +242,16 @@ def fetch_stock_data(ticker):
     except Exception as e: return {"error": f"{ticker}: {str(e)}"}
 
 # --- [웹 UI 구성] ---
-st.title("🛡️ Alpha Seeking Pro (Top 300)")
+st.title("🛡️ Alpha Seeking Pro (Auto)")
 
 with st.sidebar:
     st.header("🎯 타겟 설정")
     view_mode = st.radio("화면 모드", ["📱 모바일 카드", "💻 PC 테이블"], horizontal=True)
     st.divider()
     
-    tab1, tab2 = st.tabs(["📂 섹터 (자동분류)", "⌨️ 직접 입력"])
+    tab1, tab2 = st.tabs(["📂 자동 분류 섹터", "⌨️ 직접 입력"])
     with tab1:
-        st.info("KOSPI 200 / KOSDAQ 100 기준 자동 분류됨")
+        st.info(f"KOSPI/KOSDAQ 시총 상위 300개를 자동 분류했습니다.")
         selected_sector = st.selectbox("분석할 섹터를 선택하세요", list(SECTORS.keys()))
     with tab2:
         st.info("예시: 005930.KS, 000660.KS")
@@ -255,9 +263,8 @@ with st.sidebar:
 if scan_button:
     target_tickers = [t.strip() for t in custom_input.split(',') if t.strip()] if custom_input.strip() else SECTORS[selected_sector]
     
-    # 너무 많으면 오래 걸리므로 메시지 표시
     if len(target_tickers) > 50:
-        st.info(f"선택하신 섹터의 종목 수({len(target_tickers)}개)가 많아 시간이 조금 걸릴 수 있습니다.")
+        st.info(f"선택하신 섹터의 종목 수({len(target_tickers)}개)가 많아 시간이 조금 걸립니다.")
     
     st.subheader(f"🔍 {selected_sector if not custom_input.strip() else '커스텀'} 분석")
     
@@ -266,7 +273,6 @@ if scan_button:
         errors = []
         my_bar = st.progress(0, text=f"데이터 정밀 분석 중... (총 {len(target_tickers)}개)")
         
-        # 종목 수가 늘어났으므로 스레드 조금 늘림 (5)
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             future_to_ticker = {executor.submit(fetch_stock_data, t): t for t in target_tickers}
             for i, future in enumerate(concurrent.futures.as_completed(future_to_ticker)):
