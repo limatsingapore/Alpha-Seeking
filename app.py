@@ -13,7 +13,7 @@ from typing import Tuple, Union
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Fixed)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -29,46 +29,40 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ==============================================================================
-# [상수 및 설정 (Configuration)] - 매직 넘버 제거
+# [상수 및 설정]
 # ==============================================================================
 CONST = {
-    'TRADING_DAYS': 252,       # 연간 거래일
-    'MOM_SHORT': 20,           # 단기 모멘텀 (1개월)
-    'MOM_MID': 60,             # 중기 모멘텀 (3개월)
-    'VOL_WINDOW': 252,         # 변동성/MDD 계산 윈도우 (1년)
-    'TURNOVER_WINDOW': 60,     # 수급(회전율) 평균 계산 윈도우
-    'COST_RATE': 0.002,        # 거래비용 (0.2%)
-    'TOP_N': 20,               # 포트폴리오 편입 종목 수
-    'Z_CLIP': 3.0,             # Z-Score 윈저라이징 임계값 (±3σ)
-    'BACKTEST_YEARS': 10,      # 백테스트 기간
-    'WARMUP_DAYS': 400         # 팩터 계산을 위한 충분한 초기 데이터 확보 기간
+    'TRADING_DAYS': 252,       
+    'MOM_SHORT': 20,           
+    'MOM_MID': 60,             
+    'VOL_WINDOW': 252,         
+    'TURNOVER_WINDOW': 60,     
+    'COST_RATE': 0.002,        
+    'TOP_N': 20,               
+    'Z_CLIP': 3.0,             
+    'BACKTEST_YEARS': 10,      
+    'WARMUP_DAYS': 400         
 }
 
 # ==============================================================================
-# [핵심 로직: 팩터 계산 및 스코어링 (Single Source of Truth)]
+# [핵심 로직: 팩터 계산]
 # ==============================================================================
 
-def calculate_raw_factors_vectorized(
-    price_series: Union[pd.Series, pd.DataFrame], 
-    volume_series: Union[pd.Series, pd.DataFrame]
-) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
-    """
-    실시간 및 백테스트에서 공통으로 사용하는 벡터화된 팩터 계산 함수
-    """
-    # 1. Momentum (수익률)
+def calculate_raw_factors_vectorized(price_series, volume_series):
+    # 1. Momentum
     ret_short = price_series.pct_change(CONST['MOM_SHORT'])
     ret_mid = price_series.pct_change(CONST['MOM_MID'])
     
-    # 2. Volatility (연환산 변동성)
+    # 2. Volatility
     volatility = price_series.pct_change().rolling(CONST['VOL_WINDOW']).std() * np.sqrt(CONST['TRADING_DAYS'])
     
-    # 3. Liquidity (거래대금 Z-Score)
+    # 3. Liquidity
     turnover = price_series * volume_series
     to_mean = turnover.rolling(CONST['TURNOVER_WINDOW']).mean()
     to_std = turnover.rolling(CONST['TURNOVER_WINDOW']).std()
     turnover_z = (turnover - to_mean) / (to_std + 1e-9)
     
-    # 4. Risk (12개월 Rolling MDD)
+    # 4. Risk
     roll_max = price_series.rolling(CONST['VOL_WINDOW'], min_periods=1).max()
     drawdown = (price_series / roll_max) - 1.0
     mdd = drawdown.rolling(CONST['VOL_WINDOW'], min_periods=1).min()
@@ -76,17 +70,13 @@ def calculate_raw_factors_vectorized(
     return ret_short, ret_mid, turnover_z, volatility, mdd
 
 def normalize_and_score(factor_df, weights):
-    """
-    Z-Score 정규화, 윈저라이징, 가중합 (점수 산출)
-    """
     if factor_df.empty: return factor_df
     
-    # 방향성 정의 (1: 높을수록 좋음, -1: 낮을수록 좋음)
     directions = {
         'ret_short': 1, 'ret_mid': 1, 
         'turnover_z': 1, 
-        'volatility': -1, # 변동성은 낮을수록 좋음
-        'max_drawdown': 1 # MDD는 0(음수 중 큰 값)에 가까울수록 좋음
+        'volatility': -1, 
+        'max_drawdown': 1 
     }
     
     z_df = pd.DataFrame(index=factor_df.index)
@@ -97,22 +87,17 @@ def normalize_and_score(factor_df, weights):
         mu = factor_df[col].mean()
         sigma = factor_df[col].std()
         
-        # Z-Score 계산
         z_val = (factor_df[col] - mu) / (sigma + 1e-9)
-        
-        # Winsorize(Clip) & Direction 적용 (한 번에 처리)
         z_df[f'z_{col}'] = z_val.clip(-CONST['Z_CLIP'], CONST['Z_CLIP']) * direction
 
-    # 가중합 점수 계산
     final_score = (
-        z_df['z_ret_short'] * weights['mom'] * 0.5 +
-        z_df['z_ret_mid'] * weights['mom'] * 0.5 +
-        z_df['z_turnover_z'] * weights['liq'] +
-        z_df['z_volatility'] * weights['vol'] +
-        z_df['z_max_drawdown'] * weights['risk']
+        z_df.get('z_ret_short', 0) * weights['mom'] * 0.5 +
+        z_df.get('z_ret_mid', 0) * weights['mom'] * 0.5 +
+        z_df.get('z_turnover_z', 0) * weights['liq'] +
+        z_df.get('z_volatility', 0) * weights['vol'] +
+        z_df.get('z_max_drawdown', 0) * weights['risk']
     )
     
-    # 0~100 MinMax Scaling
     min_s, max_s = final_score.min(), final_score.max()
     if max_s - min_s == 0:
         factor_df['Total_Score'] = 50
@@ -122,7 +107,7 @@ def normalize_and_score(factor_df, weights):
     return pd.concat([factor_df, z_df], axis=1).sort_values(by='Total_Score', ascending=False)
 
 # ==============================================================================
-# [데이터 로딩 및 섹터 분류]
+# [데이터 로딩 및 섹터 분류] (KeyError 수정됨)
 # ==============================================================================
 @st.cache_data(ttl=3600*12)
 def load_market_data():
@@ -130,19 +115,37 @@ def load_market_data():
         df_krx = fdr.StockListing('KRX')
         df_etf = fdr.StockListing('ETF/KR')
         
-        # 유니버스 확장 (시총 500 + 거래대금 300)
-        sort_col = 'Marcap' if 'Marcap' in df_krx.columns else 'Close'
-        amt_col = 'Amount' if 'Amount' in df_krx.columns else 'Volume'
+        # --- [KeyError 방어 로직] ---
+        # KRX 데이터프레임 컬럼 확인 및 통일
+        if 'Code' not in df_krx.columns and 'Symbol' in df_krx.columns:
+            df_krx.rename(columns={'Symbol': 'Code'}, inplace=True)
+        if 'Marcap' not in df_krx.columns: # 시총 컬럼이 없을 경우 대비
+             # 일부 환경에서 Marcap이 없을 수 있음. Close * Shares 등으로 대체하거나 예외처리 필요
+             # 여기서는 에러 방지를 위해 임시 컬럼 생성 (데이터 품질 저하 가능성 있음)
+             if 'Close' in df_krx.columns and 'Stocks' in df_krx.columns:
+                 df_krx['Marcap'] = df_krx['Close'] * df_krx['Stocks']
+             else:
+                 df_krx['Marcap'] = 0 
+
+        # ETF 데이터프레임 컬럼 확인
+        if 'Symbol' not in df_etf.columns and 'Code' in df_etf.columns:
+            df_etf.rename(columns={'Code': 'Symbol'}, inplace=True)
         
+        # 정렬 기준
+        sort_col = 'Marcap' if 'Marcap' in df_krx.columns else 'Close'
+        amt_col = 'Amount' if 'Amount' in df_krx.columns else 'Volume' # 거래대금 혹은 거래량
+        if amt_col not in df_krx.columns: df_krx[amt_col] = 0
+
         top_cap = df_krx.sort_values(by=sort_col, ascending=False).head(500)
         top_vol = df_krx.sort_values(by=amt_col, ascending=False).head(300)
         df_stocks = pd.concat([top_cap, top_vol]).drop_duplicates(subset=['Code'])
         
-        # ETF Top 50
+        # ETF 정렬
         etf_sort = 'Marcap' if 'Marcap' in df_etf.columns else 'Amount'
+        if etf_sort not in df_etf.columns: df_etf[etf_sort] = 0
         df_etf_top = df_etf.sort_values(by=etf_sort, ascending=False).head(50)
         
-        # 섹터 분류 (우선순위 기반)
+        # 섹터 분류
         sectors = {
             "📊 ETF Top 50": [],
             "🚀 반도체/하드웨어": [], "💻 SW/플랫폼/게임": [],
@@ -160,7 +163,7 @@ def load_market_data():
         ticker_info = {}
 
         def categorize(name, sec):
-            txt = (name + " " + sec).lower()
+            txt = (str(name) + " " + str(sec)).lower()
             if any(x in txt for x in ['etf', 'kodex', 'tiger']): return "📊 ETF Top 50"
             if any(x in txt for x in ['반도체', 'sk하이닉스', '삼성전자', 'hpsp', '이수페타', 'pcb', '디스플레이', 'lg이노텍']): return "🚀 반도체/하드웨어"
             if any(x in txt for x in ['게임', '소프트웨어', '네이버', '카카오', '크래프톤', '보안', '클라우드', 'ai']): return "💻 SW/플랫폼/게임"
@@ -182,11 +185,12 @@ def load_market_data():
             if any(x in txt for x in ['통신', '텔레콤', 'kt', 'lg유플러스', '네트워크']): return "📡 통신/네트워크"
             return "🌈 기타 대형주"
 
-        code_col = 'Code' if 'Code' in df_stocks.columns else 'Symbol'
         for _, row in df_stocks.iterrows():
-            code = str(row[code_col])
+            code = str(row['Code'])
             name = str(row['Name'])
-            sec_raw = str(row.get('Sector', ''))
+            # Sector 컬럼 존재 여부 확인
+            sec_raw = str(row['Sector']) if 'Sector' in row and pd.notnull(row['Sector']) else ""
+            
             cat = categorize(name, sec_raw)
             if cat in sectors: sectors[cat].append(code)
             else: sectors["🌈 기타 대형주"].append(code)
@@ -198,7 +202,7 @@ def load_market_data():
             sectors["📊 ETF Top 50"].append(code)
             ticker_info[code] = {'Name': name}
             
-        all_tickers = df_stocks[code_col].tolist()
+        all_tickers = df_stocks['Code'].tolist()
         return sectors, ticker_info, all_tickers
 
     except Exception as e:
@@ -222,14 +226,11 @@ def get_vix():
 # ==============================================================================
 def compute_current_factors_safe(ticker):
     try:
-        # Warmup 기간 포함하여 충분한 데이터 요청
         start_date = (datetime.now() - timedelta(days=CONST['WARMUP_DAYS'] + 60)).strftime('%Y-%m-%d')
         df = fdr.DataReader(ticker, start_date)
         
-        if len(df) < CONST['TRADING_DAYS'] * 0.8: return None # 데이터 부족 시 스킵
+        if len(df) < CONST['TRADING_DAYS'] * 0.8: return None 
 
-        # 공통 함수를 사용하여 팩터 계산 (마지막 시점 값만 사용)
-        # Series로 반환됨
         ret_s, ret_m, tz, vol, mdd = calculate_raw_factors_vectorized(df['Close'], df['Volume'])
         
         return {
@@ -243,11 +244,10 @@ def compute_current_factors_safe(ticker):
             "chart_data": df['Close'].tail(60)
         }
     except Exception as e:
-        logging.warning(f"Error fetching {ticker}: {e}")
         return None
 
 # ==============================================================================
-# [모듈 2] 백테스트 엔진 (회전율 복원 & 로직 통일)
+# [모듈 2] 백테스트 엔진
 # ==============================================================================
 @st.cache_data(ttl=3600*24)
 def fetch_rolling_backtest_data(universe, start_str, end_str):
@@ -271,10 +271,8 @@ def fetch_rolling_backtest_data(universe, start_str, end_str):
     return pd.DataFrame(c_dict).ffill(), pd.DataFrame(v_dict).ffill(), kospi
 
 def run_rolling_backtest(prices, volumes, benchmark, weights):
-    # 월말 리밸런싱 날짜
     reb_dates = prices.resample('M').last().index
     
-    # 팩터 계산용 Warm-up 기간 (약 1년) 확보 확인
     start_idx = 0
     for i, d in enumerate(reb_dates):
         if (d - prices.index[0]).days > CONST['WARMUP_DAYS']:
@@ -284,23 +282,19 @@ def run_rolling_backtest(prices, volumes, benchmark, weights):
     if start_idx >= len(reb_dates) - 1: return pd.DataFrame()
 
     logs = []
-    prev_holdings = set() # 이전 달 보유 종목 (회전율 계산용)
+    prev_holdings = set()
     
     for i in range(start_idx, len(reb_dates)-1):
         curr = reb_dates[i]
         next_d = reb_dates[i+1]
         
-        # 1. 팩터 계산 (Point-in-Time, 미래 데이터 참조 금지)
-        # 충분한 버퍼를 두고 슬라이싱 (예: 400일)
         p_slice = prices.loc[:curr].tail(int(CONST['WARMUP_DAYS'] * 1.2))
         v_slice = volumes.loc[:curr].tail(int(CONST['WARMUP_DAYS'] * 1.2))
         
         if len(p_slice) < CONST['TRADING_DAYS']: continue
         
-        # 벡터화 함수로 전체 유니버스 팩터 일괄 계산
         rs, rm, tz, vol, mdd = calculate_raw_factors_vectorized(p_slice, v_slice)
         
-        # 현재 시점(iloc[-1])의 팩터 값 추출 및 DataFrame 구성
         factors_t = pd.DataFrame({
             'ret_short': rs.iloc[-1], 'ret_mid': rm.iloc[-1],
             'turnover_z': tz.iloc[-1], 'volatility': vol.iloc[-1],
@@ -309,30 +303,23 @@ def run_rolling_backtest(prices, volumes, benchmark, weights):
         
         if factors_t.empty: continue
         
-        # 2. 스코어링 & 종목 선정
         scored = normalize_and_score(factors_t, weights)
         top_picks = scored.nlargest(CONST['TOP_N'], 'Total_Score').index.tolist()
         current_holdings = set(top_picks)
         
-        # 3. 수익률 계산 (다음 달 수익률)
         fwd_ret = prices.loc[curr:next_date, top_picks].pct_change().dropna()
-        # 기간 누적 수익률 (복리)
         port_ret = (1 + fwd_ret).prod() - 1
-        gross = port_ret.mean() # 동일 비중
+        gross = port_ret.mean()
         
-        # 4. 비용 계산 (회전율 기반) - [복원됨]
         if not prev_holdings:
-            turnover_rate = 1.0 # 첫 진입
+            turnover_rate = 1.0
         else:
-            # 유지된 종목 수
             kept_count = len(prev_holdings.intersection(current_holdings))
-            # 회전율 = (전체 슬롯 - 유지된 슬롯) / 전체 슬롯
             turnover_rate = (CONST['TOP_N'] - kept_count) / CONST['TOP_N']
             
         cost = turnover_rate * CONST['COST_RATE']
         net = gross - cost
         
-        # 5. 벤치마크 비교
         bm_period = benchmark.loc[curr:next_date].pct_change().dropna()
         bm_ret = (1 + bm_period).prod() - 1
         
@@ -373,7 +360,7 @@ if mode == "📊 실시간 랭킹":
         if not targets: st.error("종목 없음")
         else:
             data = []
-            bar = st.progress(0, text="데이터 수집 및 팩터 계산 중...")
+            bar = st.progress(0, text="데이터 수집 중...")
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
                 futures = {ex.submit(compute_current_factors_safe, t): t for t in targets}
@@ -385,10 +372,8 @@ if mode == "📊 실시간 랭킹":
             
             if data:
                 f_df = pd.DataFrame(data).set_index('code')
-                # 공통 로직으로 스코어링
                 final = normalize_and_score(f_df, weights)
                 
-                # Top Pick
                 top = final.iloc[0]
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Top Pick", f"{TICKER_INFO.get(top.name, {}).get('Name', top.name)}")
@@ -397,15 +382,23 @@ if mode == "📊 실시간 랭킹":
                 vix = get_vix()
                 c3.metric("K-VIX", f"{vix:.2f}" if vix else "-")
                 
-                # Table
+                # Table (Styler 제거하고 기본 dataframe 사용, 컬럼 포맷팅만 수행)
                 disp = final[['current_price', 'Total_Score', 'ret_short', 'turnover_z', 'max_drawdown']].copy()
                 disp.columns = ['Price', 'Score', 'Mom(1M)', 'Liq(Z)', 'MDD']
                 disp.index = [TICKER_INFO.get(x,{}).get('Name',x) for x in disp.index]
                 
+                # ImportError 방지를 위해 style 메서드 대신 column_config 사용
                 st.dataframe(
-                    disp.style.background_gradient(subset=['Score'], cmap='RdYlGn')
-                    .format({'Price': '{:,.0f}', 'Score': '{:.1f}', 'Mom(1M)': '{:.2%}', 'Liq(Z)': '{:.2f}', 'MDD': '{:.2%}'}),
-                    use_container_width=True, height=600
+                    disp, 
+                    use_container_width=True, 
+                    height=600,
+                    column_config={
+                        "Price": st.column_config.NumberColumn(format="%d"),
+                        "Score": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
+                        "Mom(1M)": st.column_config.NumberColumn(format="%.2%"),
+                        "Liq(Z)": st.column_config.NumberColumn(format="%.2f"),
+                        "MDD": st.column_config.NumberColumn(format="%.2%")
+                    }
                 )
             else:
                 st.error("데이터 수집 실패")
@@ -414,23 +407,15 @@ if mode == "📊 실시간 랭킹":
 # TAB 2: Rolling Backtest
 # ------------------------------------------------------------------------------
 else:
-    # 동적 날짜 계산
     today = datetime.today()
     end_s = today.strftime('%Y-%m-%d')
     start_s = (today - timedelta(days=365*(CONST['BACKTEST_YEARS']+1))).strftime('%Y-%m-%d')
     
     st.subheader(f"📉 Rolling Backtest ({CONST['BACKTEST_YEARS']} Years)")
-    st.info(f"""
-    **분석 로직:**
-    1. **기간:** {start_s} ~ {end_s} (자동 롤링)
-    2. **유니버스:** 시총 상위 300 종목 (속도 최적화)
-    3. **비용:** 종목 교체율(Turnover) × {CONST['COST_RATE']*100}%
-    4. **팩터:** 실시간 모드와 동일한 벡터화 알고리즘 적용
-    """)
+    st.info(f"기간: {start_s} ~ {end_s} | 비용: {CONST['COST_RATE']*100}% | Top {CONST['TOP_N']}")
     
     if st.button("🚀 백테스트 시작", type="primary"):
         st.write("데이터 로딩 중... (최대 1~2분 소요)")
-        # 백테스트는 대형주 300개로 한정하여 속도 확보
         p_df, v_df, bm = fetch_rolling_backtest_data(ALL_STOCKS_LIST[:300], start_s, end_s)
         
         if p_df is not None:
@@ -444,7 +429,6 @@ else:
                 res['Cum_Port'] = (1 + res['Net']).cumprod()
                 res['Cum_BM'] = (1 + res['BM']).cumprod()
                 
-                # Metrics
                 tot = res['Cum_Port'].iloc[-1] - 1
                 days = (res.index[-1] - res.index[0]).days
                 cagr = (1 + tot) ** (365 / days) - 1
@@ -456,23 +440,26 @@ else:
                 m3.metric("Total Return", f"{tot:.1%}")
                 m4.metric("Avg Turnover", f"{res['Turnover'].mean():.1%}")
                 
-                # Plots
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=res.index, y=res['Cum_Port'], name='Portfolio', line=dict(color='red')))
                 fig.add_trace(go.Scatter(x=res.index, y=res['Cum_BM'], name='KOSPI', line=dict(color='grey', dash='dot')))
                 st.plotly_chart(fig, use_container_width=True)
                 
-                col_l, col_r = st.columns(2)
-                with col_l:
-                    st.write("##### 📊 월별 Alpha")
-                    fig_a = go.Figure(go.Bar(x=res.index, y=res['Alpha'], marker_color='cyan'))
-                    st.plotly_chart(fig_a, use_container_width=True)
-                with col_r:
-                    st.write("##### 💸 비용 및 회전율")
-                    fig_c = go.Figure()
-                    fig_c.add_trace(go.Scatter(x=res.index, y=res['Turnover'], name='Turnover', fill='tozeroy', line=dict(color='orange')))
-                    st.plotly_chart(fig_c, use_container_width=True)
-
+                # ImportError 방지를 위해 style 메서드 대신 column_config 사용
+                st.dataframe(
+                    res,
+                    use_container_width=True,
+                    column_config={
+                        "Gross": st.column_config.NumberColumn(format="%.2%"),
+                        "Net": st.column_config.NumberColumn(format="%.2%"),
+                        "Cost": st.column_config.NumberColumn(format="%.4f"),
+                        "BM": st.column_config.NumberColumn(format="%.2%"),
+                        "Alpha": st.column_config.NumberColumn(format="%.2%"),
+                        "Turnover": st.column_config.NumberColumn(format="%.2%"),
+                        "Cum_Port": st.column_config.NumberColumn(format="%.2f"),
+                        "Cum_BM": st.column_config.NumberColumn(format="%.2f")
+                    }
+                )
             else:
                 st.error("결과 산출 실패 (데이터 부족)")
         else:
