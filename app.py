@@ -7,12 +7,13 @@ import plotly.graph_objects as go
 import logging
 import FinanceDataReader as fdr
 import time
+from typing import Tuple, Union
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -28,7 +29,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ==============================================================================
-# [상수 및 설정 (Magic Numbers 제거)]
+# [상수 및 설정 (Configuration)] - 매직 넘버 제거
 # ==============================================================================
 CONST = {
     'TRADING_DAYS': 252,       # 연간 거래일
@@ -38,55 +39,54 @@ CONST = {
     'TURNOVER_WINDOW': 60,     # 수급(회전율) 평균 계산 윈도우
     'COST_RATE': 0.002,        # 거래비용 (0.2%)
     'TOP_N': 20,               # 포트폴리오 편입 종목 수
-    'Z_CLIP': 3.0,             # Z-Score 윈저라이징 임계값 (+-3)
+    'Z_CLIP': 3.0,             # Z-Score 윈저라이징 임계값 (±3σ)
     'BACKTEST_YEARS': 10,      # 백테스트 기간
-    'WARMUP_DAYS': 365         # 초기 팩터 계산을 위한 데이터 확보 기간
+    'WARMUP_DAYS': 400         # 팩터 계산을 위한 충분한 초기 데이터 확보 기간
 }
 
 # ==============================================================================
-# [공통 로직: 팩터 계산 및 정규화]
+# [핵심 로직: 팩터 계산 및 스코어링 (Single Source of Truth)]
 # ==============================================================================
 
-def calculate_raw_factors_vectorized(price_series, volume_series):
+def calculate_raw_factors_vectorized(
+    price_series: Union[pd.Series, pd.DataFrame], 
+    volume_series: Union[pd.Series, pd.DataFrame]
+) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
     """
-    단일 종목(Series) 또는 전체 유니버스(DataFrame)에 대한 팩터 계산 (벡터화)
-    실시간/백테스트 로직 통일
+    실시간 및 백테스트에서 공통으로 사용하는 벡터화된 팩터 계산 함수
     """
-    # 1. Momentum
+    # 1. Momentum (수익률)
     ret_short = price_series.pct_change(CONST['MOM_SHORT'])
     ret_mid = price_series.pct_change(CONST['MOM_MID'])
     
-    # 2. Volatility (Annualized)
-    # rolling std * sqrt(252)
+    # 2. Volatility (연환산 변동성)
     volatility = price_series.pct_change().rolling(CONST['VOL_WINDOW']).std() * np.sqrt(CONST['TRADING_DAYS'])
     
-    # 3. Liquidity (Turnover Z-score)
+    # 3. Liquidity (거래대금 Z-Score)
     turnover = price_series * volume_series
     to_mean = turnover.rolling(CONST['TURNOVER_WINDOW']).mean()
     to_std = turnover.rolling(CONST['TURNOVER_WINDOW']).std()
     turnover_z = (turnover - to_mean) / (to_std + 1e-9)
     
-    # 4. Risk (MDD - 12 Month Rolling)
-    # 윈도우 내 최고점 대비 현재 하락폭의 최솟값(가장 깊은 하락)
+    # 4. Risk (12개월 Rolling MDD)
     roll_max = price_series.rolling(CONST['VOL_WINDOW'], min_periods=1).max()
     drawdown = (price_series / roll_max) - 1.0
-    # MDD는 기간 내 '최악의 하락'이므로 min()
     mdd = drawdown.rolling(CONST['VOL_WINDOW'], min_periods=1).min()
     
     return ret_short, ret_mid, turnover_z, volatility, mdd
 
 def normalize_and_score(factor_df, weights):
     """
-    Z-Score 정규화, 윈저라이징, 가중합 (실시간/백테스트 공통)
+    Z-Score 정규화, 윈저라이징, 가중합 (점수 산출)
     """
     if factor_df.empty: return factor_df
     
-    # 팩터 방향성 정의 (1: 높을수록 좋음, -1: 낮을수록 좋음)
-    # Volatility는 낮을수록 좋음 -> -1
-    # MDD는 0에 가까울수록(음수 중 큰 값) 좋음 -> 1 (ex: -5% > -20%)
+    # 방향성 정의 (1: 높을수록 좋음, -1: 낮을수록 좋음)
     directions = {
         'ret_short': 1, 'ret_mid': 1, 
-        'turnover_z': 1, 'volatility': -1, 'max_drawdown': 1
+        'turnover_z': 1, 
+        'volatility': -1, # 변동성은 낮을수록 좋음
+        'max_drawdown': 1 # MDD는 0(음수 중 큰 값)에 가까울수록 좋음
     }
     
     z_df = pd.DataFrame(index=factor_df.index)
@@ -94,18 +94,16 @@ def normalize_and_score(factor_df, weights):
     for col, direction in directions.items():
         if col not in factor_df.columns: continue
         
-        # Z-Score (Mean/Std)
-        # 섹터 중립화는 호출 전에 데이터가 섹터별로 그룹화되어 들어오거나, 
-        # 전체 유니버스에서 수행됨. 여기서는 입력된 DF 기준 상대평가.
         mu = factor_df[col].mean()
         sigma = factor_df[col].std()
         
+        # Z-Score 계산
         z_val = (factor_df[col] - mu) / (sigma + 1e-9)
         
-        # Winsorize & Direction
+        # Winsorize(Clip) & Direction 적용 (한 번에 처리)
         z_df[f'z_{col}'] = z_val.clip(-CONST['Z_CLIP'], CONST['Z_CLIP']) * direction
 
-    # Weighted Sum
+    # 가중합 점수 계산
     final_score = (
         z_df['z_ret_short'] * weights['mom'] * 0.5 +
         z_df['z_ret_mid'] * weights['mom'] * 0.5 +
@@ -114,11 +112,13 @@ def normalize_and_score(factor_df, weights):
         z_df['z_max_drawdown'] * weights['risk']
     )
     
-    # 0~100 Rescaling
+    # 0~100 MinMax Scaling
     min_s, max_s = final_score.min(), final_score.max()
-    factor_df['Total_Score'] = ((final_score - min_s) / (max_s - min_s + 1e-9)) * 100
+    if max_s - min_s == 0:
+        factor_df['Total_Score'] = 50
+    else:
+        factor_df['Total_Score'] = ((final_score - min_s) / (max_s - min_s)) * 100
     
-    # 분석용 Z값 병합
     return pd.concat([factor_df, z_df], axis=1).sort_values(by='Total_Score', ascending=False)
 
 # ==============================================================================
@@ -130,7 +130,7 @@ def load_market_data():
         df_krx = fdr.StockListing('KRX')
         df_etf = fdr.StockListing('ETF/KR')
         
-        # 유니버스 확장: 시총 상위 500 + 거래대금 상위 300
+        # 유니버스 확장 (시총 500 + 거래대금 300)
         sort_col = 'Marcap' if 'Marcap' in df_krx.columns else 'Close'
         amt_col = 'Amount' if 'Amount' in df_krx.columns else 'Volume'
         
@@ -142,7 +142,7 @@ def load_market_data():
         etf_sort = 'Marcap' if 'Marcap' in df_etf.columns else 'Amount'
         df_etf_top = df_etf.sort_values(by=etf_sort, ascending=False).head(50)
         
-        # --- 섹터 세분화 (Broad -> Granular) ---
+        # 섹터 분류 (우선순위 기반)
         sectors = {
             "📊 ETF Top 50": [],
             "🚀 반도체/하드웨어": [], "💻 SW/플랫폼/게임": [],
@@ -161,115 +161,96 @@ def load_market_data():
 
         def categorize(name, sec):
             txt = (name + " " + sec).lower()
-            
-            # 우선순위가 중요함 (구체적인 것부터)
-            if any(x in txt for x in ['etf', 'kodex', 'tiger']): return "📊 ETF Top 50" # Fallback logic
-            
+            if any(x in txt for x in ['etf', 'kodex', 'tiger']): return "📊 ETF Top 50"
             if any(x in txt for x in ['반도체', 'sk하이닉스', '삼성전자', 'hpsp', '이수페타', 'pcb', '디스플레이', 'lg이노텍']): return "🚀 반도체/하드웨어"
             if any(x in txt for x in ['게임', '소프트웨어', '네이버', '카카오', '크래프톤', '보안', '클라우드', 'ai']): return "💻 SW/플랫폼/게임"
-            
             if any(x in txt for x in ['에코프로', '엘앤에프', '포스코퓨처', '전지', '머티리얼', '양극재', '금양', '캠']): return "🔋 2차전지/에너지"
             if any(x in txt for x in ['화학', '정유', 'oil', 'sk이노', '효성', '롯데케미', '금호', '제철', '고려아연']): return "🧪 화학/정유/소재"
-            
             if any(x in txt for x in ['삼성바이오', '셀트리온', '알테오젠', 'hlb', '유한양행', '한미약품', '리가켐', 'sk바이오']): return "💊 바이오/헬스케어"
             if any(x in txt for x in ['클래시스', '덴티움', '미용', '의료', '휴젤', '파마리서치']): return "🏥 의료기기/서비스"
-            
             if any(x in txt for x in ['금융', '은행', '지주', 'kb', '신한', '하나', '우리']): return "💰 금융(은행/지주)"
             if any(x in txt for x in ['증권', '보험', '삼성생명', '화재', '메리츠', '키움']): return "📈 증권/보험"
-            
             if any(x in txt for x in ['자동차', '현대차', '기아', '모비스', '타이어', '한온']): return "🚗 자동차/모빌리티"
             if any(x in txt for x in ['조선', '해운', 'hmm', '오션', '중공업', '팬오션', '글로비스', '대한항공']): return "🚢 조선/해운/운송"
-            
             if any(x in txt for x in ['방산', '한화에어', 'lig', '한국항공', '현대로템', '풍산']): return "🛡️ 방산/우주항공"
             if any(x in txt for x in ['전력', '전선', '일렉', '변압기', 'ls', '효성중공업', '두산에너', '한전']): return "⚡ 전력/전선/원전"
             if any(x in txt for x in ['건설', '기계', '두산밥캣', '현대건설', 'gs건설', '엔지니어링']): return "🏗️ 건설/인프라/기계"
-            
             if any(x in txt for x in ['유통', '백화점', '상사', '포스코인터', '물산', '지주', '이마트', '편의점']): return "🛍️ 유통/상사/지주"
             if any(x in txt for x in ['화장품', '아모레', '코스맥스', '영원무역', 'f&f', '패션', '의류']): return "💄 화장품/패션/의류"
             if any(x in txt for x in ['식품', '음료', '농심', '삼양', '오리온', 'cj제일', '롯데칠성']): return "🍜 식음료(F&B)"
-            
             if any(x in txt for x in ['엔터', '하이브', 'jyp', '에스엠', '스튜디오', '광고', '제일기획', '미디어']): return "🎬 미디어/엔터/광고"
             if any(x in txt for x in ['통신', '텔레콤', 'kt', 'lg유플러스', '네트워크']): return "📡 통신/네트워크"
-            
             return "🌈 기타 대형주"
 
-        # 주식 분류
         code_col = 'Code' if 'Code' in df_stocks.columns else 'Symbol'
         for _, row in df_stocks.iterrows():
             code = str(row[code_col])
             name = str(row['Name'])
             sec_raw = str(row.get('Sector', ''))
-            
             cat = categorize(name, sec_raw)
             if cat in sectors: sectors[cat].append(code)
             else: sectors["🌈 기타 대형주"].append(code)
+            ticker_info[code] = {'Name': name}
             
-            ticker_info[code] = {'Name': name, 'Sector': cat}
-            
-        # ETF 분류
         for _, row in df_etf_top.iterrows():
             code = str(row['Symbol'])
             name = str(row['Name'])
             sectors["📊 ETF Top 50"].append(code)
-            ticker_info[code] = {'Name': name, 'Sector': "ETF"}
+            ticker_info[code] = {'Name': name}
             
         all_tickers = df_stocks[code_col].tolist()
-        
         return sectors, ticker_info, all_tickers
 
     except Exception as e:
-        st.error(f"데이터 로딩 중 치명적 오류: {e}")
+        st.error(f"데이터 로딩 실패: {e}")
         return {}, {}, []
 
-with st.spinner("시장 데이터 로딩 및 섹터 정밀 분류 중..."):
+with st.spinner("시장 데이터 유니버스 구축 중..."):
     SECTORS, TICKER_INFO, ALL_STOCKS_LIST = load_market_data()
 
 # --- [VIX 안전 조회] ---
 @st.cache_data(ttl=600)
 def get_vix():
     try:
-        # 최근 7일치 중 마지막 값 (공휴일 대비)
         df = fdr.DataReader('KS200VIX', datetime.now() - timedelta(days=7))
         if not df.empty: return df['Close'].iloc[-1]
         return None
     except: return None
 
 # ==============================================================================
-# [실시간 모드] 단일 종목 팩터 계산
+# [모듈 1] 실시간 분석 실행 함수
 # ==============================================================================
 def compute_current_factors_safe(ticker):
     try:
-        # 안전하게 넉넉히 가져옴 (Warm-up 고려)
-        start_date = (datetime.now() - timedelta(days=CONST['WARMUP_DAYS'] + 100)).strftime('%Y-%m-%d')
+        # Warmup 기간 포함하여 충분한 데이터 요청
+        start_date = (datetime.now() - timedelta(days=CONST['WARMUP_DAYS'] + 60)).strftime('%Y-%m-%d')
         df = fdr.DataReader(ticker, start_date)
         
-        if len(df) < CONST['TRADING_DAYS']: return None # 데이터 부족
+        if len(df) < CONST['TRADING_DAYS'] * 0.8: return None # 데이터 부족 시 스킵
 
-        # 벡터화 함수 재사용을 위해 Series 추출
-        # (단일 종목이므로 Series로 변환됨)
-        ret_s, ret_m, turn_z, vol, mdd = calculate_raw_factors_vectorized(df['Close'], df['Volume'])
+        # 공통 함수를 사용하여 팩터 계산 (마지막 시점 값만 사용)
+        # Series로 반환됨
+        ret_s, ret_m, tz, vol, mdd = calculate_raw_factors_vectorized(df['Close'], df['Volume'])
         
-        # 마지막 시점의 값 추출
         return {
             "code": ticker,
             "current_price": df['Close'].iloc[-1],
             "ret_short": ret_s.iloc[-1],
             "ret_mid": ret_m.iloc[-1],
-            "turnover_z": turn_z.iloc[-1],
+            "turnover_z": tz.iloc[-1],
             "volatility": vol.iloc[-1],
             "max_drawdown": mdd.iloc[-1],
             "chart_data": df['Close'].tail(60)
         }
     except Exception as e:
-        logging.error(f"Factor Error {ticker}: {e}")
+        logging.warning(f"Error fetching {ticker}: {e}")
         return None
 
 # ==============================================================================
-# [백테스트 모드] 대용량 데이터 처리
+# [모듈 2] 백테스트 엔진 (회전율 복원 & 로직 통일)
 # ==============================================================================
 @st.cache_data(ttl=3600*24)
 def fetch_rolling_backtest_data(universe, start_str, end_str):
-    """지정된 기간의 전체 데이터 로드"""
     try:
         kospi = fdr.DataReader('KS11', start_str, end_str)['Close']
     except: return None, None, None
@@ -290,37 +271,36 @@ def fetch_rolling_backtest_data(universe, start_str, end_str):
     return pd.DataFrame(c_dict).ffill(), pd.DataFrame(v_dict).ffill(), kospi
 
 def run_rolling_backtest(prices, volumes, benchmark, weights):
-    # 월말 리밸런싱
+    # 월말 리밸런싱 날짜
     reb_dates = prices.resample('M').last().index
     
-    # 팩터 계산에 필요한 초기 데이터(1년) 확보 후 시작
+    # 팩터 계산용 Warm-up 기간 (약 1년) 확보 확인
     start_idx = 0
     for i, d in enumerate(reb_dates):
-        if (d - prices.index[0]).days > 360:
+        if (d - prices.index[0]).days > CONST['WARMUP_DAYS']:
             start_idx = i
             break
             
     if start_idx >= len(reb_dates) - 1: return pd.DataFrame()
 
     logs = []
+    prev_holdings = set() # 이전 달 보유 종목 (회전율 계산용)
     
     for i in range(start_idx, len(reb_dates)-1):
         curr = reb_dates[i]
         next_d = reb_dates[i+1]
         
-        # 1. 팩터 계산 (Point-in-Time)
-        # 현재 시점(curr)까지의 데이터 슬라이싱
-        # (속도 최적화를 위해 최근 400일만 사용)
-        p_slice = prices.loc[:curr].tail(400)
-        v_slice = volumes.loc[:curr].tail(400)
+        # 1. 팩터 계산 (Point-in-Time, 미래 데이터 참조 금지)
+        # 충분한 버퍼를 두고 슬라이싱 (예: 400일)
+        p_slice = prices.loc[:curr].tail(int(CONST['WARMUP_DAYS'] * 1.2))
+        v_slice = volumes.loc[:curr].tail(int(CONST['WARMUP_DAYS'] * 1.2))
         
-        if len(p_slice) < 250: continue
+        if len(p_slice) < CONST['TRADING_DAYS']: continue
         
-        # 벡터화된 함수로 모든 종목 팩터 일괄 계산 (Series 반환)
-        # .iloc[-1]을 통해 현재 시점의 팩터 값만 취함
+        # 벡터화 함수로 전체 유니버스 팩터 일괄 계산
         rs, rm, tz, vol, mdd = calculate_raw_factors_vectorized(p_slice, v_slice)
         
-        # DataFrame 구성 (Transposed to Tickers as Index)
+        # 현재 시점(iloc[-1])의 팩터 값 추출 및 DataFrame 구성
         factors_t = pd.DataFrame({
             'ret_short': rs.iloc[-1], 'ret_mid': rm.iloc[-1],
             'turnover_z': tz.iloc[-1], 'volatility': vol.iloc[-1],
@@ -329,51 +309,61 @@ def run_rolling_backtest(prices, volumes, benchmark, weights):
         
         if factors_t.empty: continue
         
-        # 2. 스코어링 & 선정
+        # 2. 스코어링 & 종목 선정
         scored = normalize_and_score(factors_t, weights)
-        top_picks = scored.nlargest(CONST['TOP_N'], 'Total_Score').index
+        top_picks = scored.nlargest(CONST['TOP_N'], 'Total_Score').index.tolist()
+        current_holdings = set(top_picks)
         
-        # 3. 수익률 계산
+        # 3. 수익률 계산 (다음 달 수익률)
         fwd_ret = prices.loc[curr:next_date, top_picks].pct_change().dropna()
+        # 기간 누적 수익률 (복리)
         port_ret = (1 + fwd_ret).prod() - 1
-        gross = port_ret.mean()
+        gross = port_ret.mean() # 동일 비중
         
-        # 4. 비용 및 알파
-        # (간소화를 위해 매월 100% 회전 가정하지 않고, 실제 교체율 계산은 생략하고 고정비용 부과도 방법이나
-        #  여기서는 요청하신 로직대로 교체율 계산 로직을 넣기엔 복잡도가 높으므로 
-        #  단순화하여 '리밸런싱 비용'으로 보수적 접근 or 이전 보유 내역 추적 필요)
-        #  -> 여기서는 이전 스텝의 top_picks를 저장해야 함.
+        # 4. 비용 계산 (회전율 기반) - [복원됨]
+        if not prev_holdings:
+            turnover_rate = 1.0 # 첫 진입
+        else:
+            # 유지된 종목 수
+            kept_count = len(prev_holdings.intersection(current_holdings))
+            # 회전율 = (전체 슬롯 - 유지된 슬롯) / 전체 슬롯
+            turnover_rate = (CONST['TOP_N'] - kept_count) / CONST['TOP_N']
+            
+        cost = turnover_rate * CONST['COST_RATE']
+        net = gross - cost
         
-        # (전역 변수가 아닌 루프 내 변수로 추적 불가하므로 Turnover는 근사치 0.8로 가정하거나
-        #  제대로 하려면 클래스화 필요. 여기서는 보수적으로 0.2% * 100% 회전 가정)
-        net = gross - CONST['COST_RATE']
-        
+        # 5. 벤치마크 비교
         bm_period = benchmark.loc[curr:next_date].pct_change().dropna()
         bm_ret = (1 + bm_period).prod() - 1
         
         logs.append({
-            'Date': next_d, 'Gross': gross, 'Net': net, 
-            'BM': bm_ret, 'Alpha': net - bm_ret
+            'Date': next_d, 'Gross': gross, 'Net': net, 'Cost': cost,
+            'BM': bm_ret, 'Alpha': net - bm_ret, 'Turnover': turnover_rate
         })
+        
+        prev_holdings = current_holdings
         
     return pd.DataFrame(logs)
 
 # ==============================================================================
 # [메인 UI]
 # ==============================================================================
-st.title("🧬 Alpha Seeking Pro")
+st.title("🧬 Alpha Seeking Pro (Master Ver.)")
 
 with st.sidebar:
-    st.header("⚙️ 전략 설정")
-    w_mom = st.slider("Momentum (추세)", 0.0, 1.0, 0.4)
-    w_liq = st.slider("Liquidity (수급)", 0.0, 1.0, 0.2)
-    w_vol = st.slider("Volatility (안정)", 0.0, 1.0, 0.2)
-    w_risk = st.slider("Risk (방어)", 0.0, 1.0, 0.2)
+    st.header("⚙️ 팩터 가중치")
+    w_mom = st.slider("Momentum (추세)", 0.0, 1.0, 0.4, 0.1)
+    w_liq = st.slider("Liquidity (수급)", 0.0, 1.0, 0.2, 0.1)
+    w_vol = st.slider("Volatility (안정)", 0.0, 1.0, 0.2, 0.1)
+    w_risk = st.slider("Risk (방어)", 0.0, 1.0, 0.2, 0.1)
     weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
     
     st.divider()
     mode = st.radio("모드", ["📊 실시간 랭킹", "📉 백테스트"])
 
+# ------------------------------------------------------------------------------
+# TAB 1: 실시간 랭킹
+# ------------------------------------------------------------------------------
 if mode == "📊 실시간 랭킹":
     st.subheader("실시간 팩터 스코어링")
     sec = st.selectbox("섹터", list(SECTORS.keys()))
@@ -383,7 +373,7 @@ if mode == "📊 실시간 랭킹":
         if not targets: st.error("종목 없음")
         else:
             data = []
-            bar = st.progress(0)
+            bar = st.progress(0, text="데이터 수집 및 팩터 계산 중...")
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
                 futures = {ex.submit(compute_current_factors_safe, t): t for t in targets}
@@ -395,9 +385,10 @@ if mode == "📊 실시간 랭킹":
             
             if data:
                 f_df = pd.DataFrame(data).set_index('code')
+                # 공통 로직으로 스코어링
                 final = normalize_and_score(f_df, weights)
                 
-                # UI Display
+                # Top Pick
                 top = final.iloc[0]
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Top Pick", f"{TICKER_INFO.get(top.name, {}).get('Name', top.name)}")
@@ -410,10 +401,20 @@ if mode == "📊 실시간 랭킹":
                 disp = final[['current_price', 'Total_Score', 'ret_short', 'turnover_z', 'max_drawdown']].copy()
                 disp.columns = ['Price', 'Score', 'Mom(1M)', 'Liq(Z)', 'MDD']
                 disp.index = [TICKER_INFO.get(x,{}).get('Name',x) for x in disp.index]
-                st.dataframe(disp.style.background_gradient(subset=['Score'], cmap='RdYlGn'), use_container_width=True, height=600)
+                
+                st.dataframe(
+                    disp.style.background_gradient(subset=['Score'], cmap='RdYlGn')
+                    .format({'Price': '{:,.0f}', 'Score': '{:.1f}', 'Mom(1M)': '{:.2%}', 'Liq(Z)': '{:.2f}', 'MDD': '{:.2%}'}),
+                    use_container_width=True, height=600
+                )
+            else:
+                st.error("데이터 수집 실패")
 
+# ------------------------------------------------------------------------------
+# TAB 2: Rolling Backtest
+# ------------------------------------------------------------------------------
 else:
-    # 날짜 동적 계산
+    # 동적 날짜 계산
     today = datetime.today()
     end_s = today.strftime('%Y-%m-%d')
     start_s = (today - timedelta(days=365*(CONST['BACKTEST_YEARS']+1))).strftime('%Y-%m-%d')
@@ -422,13 +423,14 @@ else:
     st.info(f"""
     **분석 로직:**
     1. **기간:** {start_s} ~ {end_s} (자동 롤링)
-    2. **유니버스:** 시총 상위 300 종목
-    3. **비용:** {CONST['COST_RATE']*100}%
-    4. **Top N:** {CONST['TOP_N']} 종목
+    2. **유니버스:** 시총 상위 300 종목 (속도 최적화)
+    3. **비용:** 종목 교체율(Turnover) × {CONST['COST_RATE']*100}%
+    4. **팩터:** 실시간 모드와 동일한 벡터화 알고리즘 적용
     """)
     
     if st.button("🚀 백테스트 시작", type="primary"):
         st.write("데이터 로딩 중... (최대 1~2분 소요)")
+        # 백테스트는 대형주 300개로 한정하여 속도 확보
         p_df, v_df, bm = fetch_rolling_backtest_data(ALL_STOCKS_LIST[:300], start_s, end_s)
         
         if p_df is not None:
@@ -444,20 +446,33 @@ else:
                 
                 # Metrics
                 tot = res['Cum_Port'].iloc[-1] - 1
-                cagr = (1 + tot) ** (365 / (res.index[-1] - res.index[0]).days) - 1
+                days = (res.index[-1] - res.index[0]).days
+                cagr = (1 + tot) ** (365 / days) - 1
                 mdd = (res['Cum_Port'] / res['Cum_Port'].cummax() - 1).min()
                 
-                m1, m2, m3 = st.columns(3)
+                m1, m2, m3, m4 = st.columns(4)
                 m1.metric("CAGR", f"{cagr:.1%}")
                 m2.metric("MDD", f"{mdd:.1%}")
                 m3.metric("Total Return", f"{tot:.1%}")
+                m4.metric("Avg Turnover", f"{res['Turnover'].mean():.1%}")
                 
+                # Plots
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=res.index, y=res['Cum_Port'], name='Portfolio', line=dict(color='red')))
                 fig.add_trace(go.Scatter(x=res.index, y=res['Cum_BM'], name='KOSPI', line=dict(color='grey', dash='dot')))
                 st.plotly_chart(fig, use_container_width=True)
                 
-                st.dataframe(res.style.format("{:.2%}"), use_container_width=True)
+                col_l, col_r = st.columns(2)
+                with col_l:
+                    st.write("##### 📊 월별 Alpha")
+                    fig_a = go.Figure(go.Bar(x=res.index, y=res['Alpha'], marker_color='cyan'))
+                    st.plotly_chart(fig_a, use_container_width=True)
+                with col_r:
+                    st.write("##### 💸 비용 및 회전율")
+                    fig_c = go.Figure()
+                    fig_c.add_trace(go.Scatter(x=res.index, y=res['Turnover'], name='Turnover', fill='tozeroy', line=dict(color='orange')))
+                    st.plotly_chart(fig_c, use_container_width=True)
+
             else:
                 st.error("결과 산출 실패 (데이터 부족)")
         else:
