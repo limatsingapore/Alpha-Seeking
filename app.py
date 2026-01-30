@@ -12,7 +12,7 @@ import FinanceDataReader as fdr
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Quant)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -31,79 +31,58 @@ st.markdown("""
 @st.cache_data(ttl=600)
 def get_vix():
     try:
-        # 한국 VIX 우선 시도
         kvix = yf.Ticker("^KS200VIX").history(period="1d")
-        if not kvix.empty:
-            return kvix['Close'].iloc[-1]
-        # 실패시 미국 VIX
+        if not kvix.empty: return kvix['Close'].iloc[-1]
         us_vix = yf.Ticker("^VIX").history(period="1d")
-        if not us_vix.empty:
-            return us_vix['Close'].iloc[-1]
+        if not us_vix.empty: return us_vix['Close'].iloc[-1]
         return 0.0
     except: return 0.0
 
-# --- [★ 핵심 데이터 로딩 함수 (에러 수정됨)] ---
+# --- [데이터 로딩: 유니버스 대폭 확장] ---
 @st.cache_data(ttl=3600*12)
 def load_market_data():
-    # 1. KRX 전체 종목 (코스피+코스닥)
+    # 1. KRX 전체 종목 (코스피 + 코스닥)
     df_krx = fdr.StockListing('KRX')
     
-    # 2. 한국 ETF 전체
-    df_etf = fdr.StockListing('ETF/KR')
-    
-    # --- 주식 필터링 (시총 상위) ---
-    # 컬럼명이 'Marcap'이 없는 경우를 대비해 'Close' 등으로 대체 정렬
+    # 2. 유니버스 확장: 시가총액 상위 500개 + 거래대금 상위 300개 (중복 제거)
+    # Marcap이 없는 경우 대비 Close * Stocks로 계산 시도하거나 Close로 대체
     sort_col = 'Marcap' if 'Marcap' in df_krx.columns else 'Close'
+    amount_col = 'Amount' if 'Amount' in df_krx.columns else 'Close'
     
-    # 코스피 200개
-    df_kospi = df_krx[df_krx['Market'] == 'KOSPI'].sort_values(by=sort_col, ascending=False).head(200)
-    # 코스닥 100개
-    df_kosdaq = df_krx[df_krx['Market'] == 'KOSDAQ'].sort_values(by=sort_col, ascending=False).head(100)
-    
-    df_stocks = pd.concat([df_kospi, df_kosdaq])
-    
-    # --- ETF 필터링 (시총 상위 50개) ---
-    # ETF 데이터셋은 Marcap 컬럼이 없을 수 있음 -> 거래대금(Amount) 순으로 대체 가능
-    etf_sort = 'Marcap' if 'Marcap' in df_etf.columns else ('Amount' if 'Amount' in df_etf.columns else 'Price')
+    top_cap = df_krx.sort_values(by=sort_col, ascending=False).head(500)
+    top_vol = df_krx.sort_values(by=amount_col, ascending=False).head(300)
+    df_stocks = pd.concat([top_cap, top_vol]).drop_duplicates(subset=['Code'])
+
+    # 3. ETF 데이터
+    df_etf = fdr.StockListing('ETF/KR')
+    etf_sort = 'Marcap' if 'Marcap' in df_etf.columns else 'Amount'
     df_etf_top = df_etf.sort_values(by=etf_sort, ascending=False).head(50)
 
-    # --- 섹터 초기화 ---
+    # --- 섹터 분류 (GICS 유사 방식 + 테마) ---
     sectors = {
-        "📊 시가총액 상위 ETF (Top 50)": [],
-        "🚀 반도체 & IT": [],
-        "🔋 2차전지 & 화학": [],
-        "💊 제약 & 바이오": [],
-        "💰 금융 (지주/증권/은행)": [],
-        "🚗 자동차 & 운송": [],
-        "🛡️ 방산/조선/전력/건설": [],
-        "💄 소비재 (화장품/식품/엔터)": [],
-        "🎮 플랫폼 & 게임 & 통신": [],
-        "🏙️ 코스닥 우량주 (바이오/IT 외)": [],
+        "📊 Top 50 ETFs": [],
+        "🚀 IT/반도체/하드웨어": [],
+        "🔋 2차전지/화학/에너지": [],
+        "💊 헬스케어/바이오": [],
+        "💰 금융/지주/보험": [],
+        "🚗 자동차/운송/물류": [],
+        "🛡️ 산업재 (방산/조선/건설/전력)": [],
+        "🛍️ 소비재 (식품/화장품/유통)": [],
+        "🎮 커뮤니케이션 (게임/미디어/통신)": [],
         "🌈 기타 대형주": []
     }
     
     ticker_name_map = {}
 
-    # --- 통합 처리 함수 (컬럼명 자동 감지) ---
     def process_tickers(df, is_etf=False):
-        # [수정 포인트] 데이터 소스마다 종목코드 컬럼명이 다름 ('Code' vs 'Symbol')
-        if 'Code' in df.columns:
-            code_col = 'Code'
-        elif 'Symbol' in df.columns:
-            code_col = 'Symbol'
-        else:
-            return # 컬럼이 없으면 스킵
-
+        code_col = 'Code' if 'Code' in df.columns else 'Symbol'
         has_sector = 'Sector' in df.columns
-        has_industry = 'Industry' in df.columns
         
         for _, row in df.iterrows():
-            code = str(row[code_col]) # 동적 컬럼명 사용
+            code = str(row[code_col])
             name = str(row['Name'])
             
-            # 티커 접미사 처리
-            if is_etf:
-                suffix = ".KS" # ETF는 대부분 코스피 상장 취급
+            if is_etf: suffix = ".KS"
             else:
                 market = row.get('Market', 'KOSPI')
                 suffix = ".KS" if market == 'KOSPI' else ".KQ"
@@ -111,48 +90,43 @@ def load_market_data():
             yf_ticker = code + suffix
             ticker_name_map[yf_ticker] = name
             
-            # 1. ETF 분류
             if is_etf:
-                sectors["📊 시가총액 상위 ETF (Top 50)"].append(yf_ticker)
+                sectors["📊 Top 50 ETFs"].append(yf_ticker)
                 continue
 
-            # 2. 주식 키워드 분류
+            # 키워드 기반 섹터 매핑
             sector_val = str(row['Sector']) if has_sector and pd.notnull(row['Sector']) else ""
-            industry_val = str(row['Industry']) if has_industry and pd.notnull(row['Industry']) else ""
-            combined_text = (name + " " + sector_val + " " + industry_val).lower()
+            combined_text = (name + " " + sector_val).lower()
             
-            if any(x in combined_text for x in ['반도체', '전자', '디스플레이', 'sk하이닉스', 'hpsp', '리노', '이수페타시스', '가온칩스', '삼성전자']):
-                sectors["🚀 반도체 & IT"].append(yf_ticker)
-            elif any(x in combined_text for x in ['전지', '화학', '에너지', '에코프로', '포스코퓨처', '금양', '엘앤에프', '캠']):
-                sectors["🔋 2차전지 & 화학"].append(yf_ticker)
-            elif any(x in combined_text for x in ['제약', '바이오', '생명', '헬스', '알테오젠', 'hlb', '셀트리온', '삼천당', '리가켐']):
-                sectors["💊 제약 & 바이오"].append(yf_ticker)
-            elif any(x in combined_text for x in ['금융', '지주', '은행', '증권', '보험', '메리츠', '기업은행', '삼성생명']):
-                sectors["💰 금융 (지주/증권/은행)"].append(yf_ticker)
-            elif any(x in combined_text for x in ['자동차', '부품', '에어', '항공', '해운', '글로비스', '기아', '현대차', '모비스']):
-                sectors["🚗 자동차 & 운송"].append(yf_ticker)
-            elif any(x in combined_text for x in ['중공업', '방산', '기계', '전력', '전선', '건설', '조선', '한화', '현대일렉', '로템']):
-                sectors["🛡️ 방산/조선/전력/건설"].append(yf_ticker)
-            elif any(x in combined_text for x in ['식품', '음료', '화장품', '엔터', '투어', '쇼핑', 'f&b', '하이브', '푸드', '아모레', 'cj']):
-                sectors["💄 소비재 (화장품/식품/엔터)"].append(yf_ticker)
-            elif any(x in combined_text for x in ['소프트웨어', '게임', '통신', '서비스', '인터넷', '네이버', '카카오', '크래프톤', '텔레콤']):
-                sectors["🎮 플랫폼 & 게임 & 통신"].append(yf_ticker)
-            elif suffix == ".KQ": # 코스닥인데 위 카테고리에 안 걸린 우량주
-                sectors["🏙️ 코스닥 우량주 (바이오/IT 외)"].append(yf_ticker)
+            if any(x in combined_text for x in ['반도체', '전자', '디스플레이', '통신장비', 'sk하이닉스', 'hpsp', '가온칩스', '이수페타시스']):
+                sectors["🚀 IT/반도체/하드웨어"].append(yf_ticker)
+            elif any(x in combined_text for x in ['전지', '화학', '에너지', '금속', '에코프로', '포스코', '엘앤에프', '캠']):
+                sectors["🔋 2차전지/화학/에너지"].append(yf_ticker)
+            elif any(x in combined_text for x in ['제약', '바이오', '의료', '생명', '알테오젠', 'hlb', '셀트리온', '삼천당']):
+                sectors["💊 헬스케어/바이오"].append(yf_ticker)
+            elif any(x in combined_text for x in ['금융', '지주', '은행', '증권', '보험', '메리츠', '기업은행']):
+                sectors["💰 금융/지주/보험"].append(yf_ticker)
+            elif any(x in combined_text for x in ['자동차', '부품', '운송', '항공', '해운', '기아', '현대차', '글로비스']):
+                sectors["🚗 자동차/운송/물류"].append(yf_ticker)
+            elif any(x in combined_text for x in ['기계', '방산', '조선', '건설', '전력', '전선', '한화', '현대일렉', '로템']):
+                sectors["🛡️ 산업재 (방산/조선/건설/전력)"].append(yf_ticker)
+            elif any(x in combined_text for x in ['식품', '음료', '화장품', '의복', '유통', '백화점', '하이브', '엔터', '아모레', 'cj']):
+                sectors["🛍️ 소비재 (식품/화장품/유통)"].append(yf_ticker)
+            elif any(x in combined_text for x in ['소프트웨어', '게임', '서비스', '통신', '네이버', '카카오', '크래프톤', '텔레콤']):
+                sectors["🎮 커뮤니케이션 (게임/미디어/통신)"].append(yf_ticker)
             else:
                 sectors["🌈 기타 대형주"].append(yf_ticker)
 
-    # 실행
     process_tickers(df_stocks, is_etf=False)
     process_tickers(df_etf_top, is_etf=True)
 
     return sectors, ticker_name_map
 
-# --- [데이터 로딩] ---
-with st.spinner("시장 데이터(코스피/코스닥/ETF) 분석 중... (약 15초 소요)"):
+# --- [데이터 로딩 실행] ---
+with st.spinner("시장 데이터 유니버스 구축 중 (상위 800+ 종목)..."):
     SECTORS, TICKER_MAP = load_market_data()
 
-# --- [헬퍼 함수들] ---
+# --- [헬퍼 함수] ---
 def get_stock_name(ticker):
     return TICKER_MAP.get(ticker, ticker)
 
@@ -162,224 +136,159 @@ def get_news_sentiment(ticker):
         news = stock.news
         if not news: return 0
         pos_words = ['체결', '수주', '흑자', '개발', '승인', '제휴', '공급', 'M&A', '협력', '상향']
-        neg_words = ['적자', '소송', '해지', '반려', '거절', '횡령', '배임', '하향', '유상증자']
+        neg_words = ['적자', '소송', '해지', '반려', '거절', '횡령', '배임', '하향', '유상증자', '거래정지']
         score = 0
+        risk_flag = False
         for article in news[:3]:
             title = article.get('title', '').lower()
             for pw in pos_words:
                 if pw in title: score += 5
             for nw in neg_words:
-                if nw in title: score -= 5
-        return max(-10, min(10, score))
-    except: return 0
+                if nw in title: 
+                    score -= 5
+                    if nw in ['횡령', '배임', '상장폐지', '거래정지']: risk_flag = True
+        return max(-10, min(10, score)), risk_flag
+    except: return 0, False
 
-def calculate_indicators(hist):
-    # MACD
-    ema12 = hist['Close'].ewm(span=12, adjust=False).mean()
-    ema26 = hist['Close'].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal_line = macd.ewm(span=9, adjust=False).mean()
-    # BB
-    sma20 = hist['Close'].rolling(window=20).mean()
-    std20 = hist['Close'].rolling(window=20).std()
-    upper_band = sma20 + (std20 * 2)
-    lower_band = sma20 - (std20 * 2)
-    # SMA
-    sma120 = hist['Close'].rolling(window=120).mean()
-    sma50 = hist['Close'].rolling(window=50).mean()
-    sma20 = hist['Close'].rolling(window=20).mean()
-    sma5 = hist['Close'].rolling(window=5).mean()
+# --- [★ 퀀트 팩터 계산 함수] ---
+def calculate_quant_factors(hist):
+    """모멘텀, 변동성, 수급, 회전성, 볼린저밴드 등 팩터 계산"""
+    if len(hist) < 252: return None # 최소 1년 데이터 권장
+    
+    factors = {}
+    
+    # 1. 모멘텀 (Momentum)
+    ret_1m = hist['Close'].pct_change(21).iloc[-1]
+    ret_3m = hist['Close'].pct_change(63).iloc[-1]
+    ret_6m = hist['Close'].pct_change(126).iloc[-1]
+    ret_12m = hist['Close'].pct_change(252).iloc[-1]
+    # 12개월 수익률에서 최근 1개월 제외 (단기 과열 방지 로직 적용 시)
+    factors['momentum_score'] = (ret_12m * 0.4) + (ret_6m * 0.3) + (ret_3m * 0.2) + (ret_1m * 0.1)
+    
+    # 2. 변동성 (Volatility) - 낮을수록 좋음 (안정성)
+    daily_vol = hist['Close'].pct_change().std() * np.sqrt(252)
+    factors['volatility'] = daily_vol
+    
+    # 3. 거래량 추세 (Volume Trend)
+    vol_20 = hist['Volume'].rolling(20).mean().iloc[-1]
+    vol_60 = hist['Volume'].rolling(60).mean().iloc[-1]
+    factors['volume_trend'] = vol_20 / (vol_60 + 1e-9)
+    
+    # 4. 평균 회귀 (Mean Reversion) - RSI & CCI
+    # RSI
+    delta = hist['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs)).iloc[-1]
+    
     # CCI
     tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
-    sma_tp = tp.rolling(window=20).mean()
-    mad = (tp - sma_tp).abs().rolling(window=20).mean()
-    cci = (tp - sma_tp) / (0.015 * mad)
+    sma_tp = tp.rolling(20).mean()
+    mad = tp.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))))
+    cci = ((tp - sma_tp) / (0.015 * mad)).iloc[-1]
     
-    return macd, signal_line, upper_band, sma120, sma50, sma20, sma5, cci
+    factors['rsi'] = rsi
+    factors['cci'] = cci
+    
+    # 5. 볼린저 밴드 위치 (BB Position)
+    sma20 = hist['Close'].rolling(20).mean().iloc[-1]
+    std20 = hist['Close'].rolling(20).std().iloc[-1]
+    factors['bb_position'] = (hist['Close'].iloc[-1] - sma20) / (2 * std20) # 1.0이면 상단, -1.0이면 하단
+    
+    return factors
 
-def fetch_stock_data(ticker):
+# --- [★ 퀀트 스코어링 함수] ---
+def score_quant(factors, weights):
+    """팩터 값에 가중치를 적용하여 0~100점 산출"""
+    score = 0
+    max_score = sum(weights.values())
+    
+    # 1. 모멘텀 (높을수록 좋음)
+    mom = factors['momentum_score']
+    if mom > 0.5: s = 100
+    elif mom > 0.2: s = 80
+    elif mom > 0: s = 60
+    elif mom > -0.2: s = 40
+    else: s = 20
+    score += s * (weights['momentum'] / 100)
+    
+    # 2. 변동성 (낮을수록 좋음)
+    vol = factors['volatility']
+    if vol < 0.2: s = 100
+    elif vol < 0.3: s = 80
+    elif vol < 0.4: s = 60
+    elif vol < 0.6: s = 40
+    else: s = 20
+    score += s * (weights['volatility'] / 100)
+    
+    # 3. 수급 (거래량 추세)
+    vt = factors['volume_trend']
+    if vt > 2.0: s = 100
+    elif vt > 1.2: s = 80
+    elif vt > 1.0: s = 60
+    else: s = 40
+    score += s * (weights['volume'] / 100)
+    
+    # 4. 회전성 (과매도 구간에서 높은 점수)
+    rsi = factors['rsi']
+    if rsi <= 30: s = 100 # 과매도 (매수 기회)
+    elif rsi <= 45: s = 80
+    elif rsi <= 60: s = 60
+    elif rsi <= 75: s = 40
+    else: s = 20 # 과매수 (위험)
+    score += s * (weights['reversion'] / 100)
+    
+    # 정규화 (100점 만점)
+    # 가중치 합이 100이라고 가정 시 그대로 사용, 아니면 비율 조정
+    return score
+
+# --- [TA(기술적 분석) 스코어링 - 기존 로직 유지] ---
+def score_ta(hist):
+    # 기존 SMA 골든크로스, 정배열 로직 등을 간단히 점수화
+    cur_price = hist['Close'].iloc[-1]
+    sma20 = hist['Close'].rolling(20).mean().iloc[-1]
+    sma60 = hist['Close'].rolling(60).mean().iloc[-1]
+    sma120 = hist['Close'].rolling(120).mean().iloc[-1]
+    
+    score = 0
+    if cur_price > sma20: score += 20
+    if cur_price > sma60: score += 20
+    if cur_price > sma120: score += 20
+    if sma20 > sma60: score += 20 # 정배열 초기
+    if sma60 > sma120: score += 20
+    return score
+
+# --- [통합 데이터 수집 및 계산] ---
+def fetch_enhanced_stock_data(ticker, weights):
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1y")
-        if hist.empty or len(hist) < 120: return {"error": f"{ticker}: 데이터 부족"}
-
+        if hist.empty or len(hist) < 250: return {"error": f"{ticker}: 데이터 부족"}
+        
+        # 1. 기본 정보
         cur_price = hist['Close'].iloc[-1]
         prev_close = hist['Close'].iloc[-2]
         day_chg = ((cur_price - prev_close) / prev_close) * 100
-        vol_avg = hist['Volume'].rolling(20).mean().iloc[-1]
-        rvol = (hist['Volume'].iloc[-1] / vol_avg) if vol_avg > 0 else 0
         
-        delta = hist['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rsi = 100 if loss.iloc[-1] == 0 else 100 - (100 / (1 + gain.iloc[-1] / loss.iloc[-1]))
+        # 2. 팩터 계산
+        q_factors = calculate_quant_factors(hist)
+        if not q_factors: return {"error": f"{ticker}: 팩터 계산 실패"}
         
-        macd, signal_line, upper_band, sma120, sma50, sma20, sma5, cci = calculate_indicators(hist)
+        # 3. 점수 산출
+        quant_score = score_quant(q_factors, weights)
+        ta_score = score_ta(hist)
         
-        cur_macd, cur_signal = macd.iloc[-1], signal_line.iloc[-1]
-        cur_upper = upper_band.iloc[-1]
-        cur_sma120 = sma120.iloc[-1]
-        cur_sma50, prev_sma50 = sma50.iloc[-1], sma50.iloc[-2]
-        cur_sma20, prev_sma20 = sma20.iloc[-1], sma20.iloc[-2]
-        cur_sma5, prev_sma5 = sma5.iloc[-1], sma5.iloc[-2]
-        cur_cci = cci.iloc[-1]
-
-        score = 0
-        reasons = [] 
+        # 뉴스 및 리스크
+        news_score, risk_flag = get_news_sentiment(ticker)
         
-        # 1. 추세
-        if cur_price >= cur_sma120: score += 20; reasons.append("장기정배열")
-        else: score -= 10
+        # 최종 점수 (Final Score) = Quant(60%) + TA(30%) + News(10%) + VIX보정
+        final_score = (quant_score * 0.6) + (ta_score * 0.3) + (news_score)
         
-        # 2. 골든크로스
-        is_short_gc = (prev_sma5 < prev_sma20) and (cur_sma5 >= cur_sma20)
-        if is_short_gc: score += 20; reasons.append("단기골든크로스")
-        elif cur_sma5 > cur_sma20: score += 10
+        # 리스크 발생 시 점수 대폭 삭감
+        if risk_flag: final_score = 0
         
-        is_mid_gc = (prev_close < prev_sma50) and (cur_price >= cur_sma50)
-        if is_mid_gc: score += 15; reasons.append("50일선돌파")
-        elif cur_price >= cur_sma50: score += 5
+        # VIX 보정
+        if get_vix() > 25: final_score -= 10
         
-        # 3. 보조지표
-        if cur_macd > cur_signal: score += 10
-        if cur_cci < -100: score += 10; reasons.append("CCI침체")
-        
-        # 4. RSI
-        if rsi <= 35: score += 15; reasons.append("RSI과매도")
-        elif 40 <= rsi <= 65: score += 5
-        elif rsi >= 75: score -= 15; reasons.append("RSI과열")
-
-        # 5. 기타
-        vix = get_vix()
-        if vix > 25: score -= 10
-        news_score = get_news_sentiment(ticker)
-        score += news_score
-        if news_score > 0: reasons.append("호재뉴스")
-        if rvol > 1.5: score += 5
-
-        score = max(0, min(100, score))
-        
-        signal = "⚖️ 중립 (관망)"
-        if rsi >= 80 or cur_price > cur_upper * 1.05:
-            signal = "🔥 과열 (진입금지)"
-            reasons.insert(0, "단기급등")
-        elif is_mid_gc or is_short_gc:
-            signal = "✨ 추세전환 시도"
-        elif score >= 75:
-            signal = "🚀 강력 매수"
-        elif score >= 60:
-            signal = "👍 매수"
-        elif score <= 35:
-            signal = "⚠️ 매도/관망"
-            
-        reason_str = ", ".join(reasons) if reasons else "-"
-
-        return {
-            "Ticker": ticker, "Name": get_stock_name(ticker),
-            "Price": cur_price, "Change": day_chg,
-            "RVOL": rvol, "RSI": rsi, "CCI": cur_cci,
-            "Score": score, "Signal": signal, "Summary": reason_str,
-            "chart_data": hist['Close'].tail(60), "SMA50_Cross": is_mid_gc
-        }
-    except Exception as e: return {"error": f"{ticker}: {str(e)}"}
-
-# --- [웹 UI 구성] ---
-st.title("🛡️ Alpha Seeking Pro (Auto)")
-
-with st.sidebar:
-    st.header("🎯 타겟 설정")
-    view_mode = st.radio("화면 모드", ["📱 모바일 카드", "💻 PC 테이블"], horizontal=True)
-    st.divider()
-    
-    tab1, tab2 = st.tabs(["📂 자동 분류 섹터", "⌨️ 직접 입력"])
-    with tab1:
-        st.info("KOSPI 200 / KOSDAQ 100 / ETF 50 자동 분석")
-        selected_sector = st.selectbox("분석할 섹터를 선택하세요", list(SECTORS.keys()))
-    with tab2:
-        st.info("예시: 005930.KS, 000660.KS")
-        custom_input = st.text_area("티커 입력", height=100)
-    
-    st.divider()
-    scan_button = st.button("📊 분석 시작 (START)", type="primary", use_container_width=True)
-
-if scan_button:
-    target_tickers = [t.strip() for t in custom_input.split(',') if t.strip()] if custom_input.strip() else SECTORS[selected_sector]
-    
-    if len(target_tickers) > 60:
-        st.info(f"선택하신 섹터의 종목 수({len(target_tickers)}개)가 많아 분석에 시간이 소요됩니다.")
-    
-    st.subheader(f"🔍 {selected_sector if not custom_input.strip() else '커스텀'} 분석")
-    
-    if len(target_tickers) > 0:
-        results = []
-        errors = []
-        my_bar = st.progress(0, text=f"데이터 정밀 분석 중... (총 {len(target_tickers)}개)")
-        
-        # 스레드 최적화 (5개)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_ticker = {executor.submit(fetch_stock_data, t): t for t in target_tickers}
-            for i, future in enumerate(concurrent.futures.as_completed(future_to_ticker)):
-                res = future.result()
-                if res and "error" in res: errors.append(res['error'])
-                elif res: results.append(res)
-                my_bar.progress((i + 1) / len(target_tickers))
-        my_bar.empty()
-
-        if results:
-            df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
-            
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("분석 종목", f"{len(df)}개")
-            c2.metric("50일선 돌파", f"{len(df[df['SMA50_Cross']])}개")
-            c3.metric("평균 수익률", f"{df['Change'].mean():.2f}%")
-            # [수정] VIX 라벨 명확화
-            c4.metric("한국 공포지수(K-VIX)", f"{get_vix():.2f}")
-
-            if "모바일" in view_mode:
-                st.caption("💡 카드를 누르면 상세 차트가 펼쳐집니다.")
-                for idx, row in df.iterrows():
-                    header_icon = "✨" if row['SMA50_Cross'] else ("🔥" if "과열" in row['Signal'] else ("🚀" if "강력" in row['Signal'] else "📊"))
-                    with st.expander(f"{header_icon} {row['Name']} | {row['Signal']} ({row['Change']:+.2f}%)", expanded=False):
-                        st.markdown(f"**📌 요약:** :blue[{row['Summary']}]")
-                        m1, m2, m3, m4 = st.columns(4)
-                        m1.metric("점수", f"{row['Score']:.0f}")
-                        m2.metric("현재가", f"{row['Price']:,.0f}")
-                        m3.metric("RSI", f"{row['RSI']:.0f}")
-                        m4.metric("RVOL", f"{row['RVOL']:.1f}")
-                        
-                        fig = go.Figure()
-                        color = '#ef4444' if row['Change'] > 0 else '#3b82f6'
-                        fig.add_trace(go.Scatter(x=row['chart_data'].index, y=row['chart_data'], mode='lines', line=dict(color=color, width=2)))
-                        fig.update_layout(height=180, margin=dict(t=10,b=10,l=10,r=10), template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', font=dict(color="white"))
-                        st.plotly_chart(fig, use_container_width=True)
-
-            else:
-                df_display = df.drop(columns=['chart_data', 'SMA50_Cross'])
-                def color_signal(val):
-                    if '강력' in val: return 'color: #ef4444; font-weight: bold'
-                    if '전환' in val: return 'color: #f59e0b; font-weight: bold'
-                    if '매수' in val: return 'color: #facc15'
-                    if '과열' in val: return 'color: #dc2626'
-                    if '매도' in val: return 'color: #3b82f6'
-                    if '중립' in val: return 'color: #94a3b8'
-                    return 'color: white'
-
-                st.dataframe(
-                    df_display.style.map(color_signal, subset=['Signal']).format({
-                        'Price': '{:,.0f} 원', 'Change': '{:+.2f}%', 
-                        'RSI': '{:.0f}', 'CCI': '{:.0f}', 'RVOL': '{:.1f}x', 'Score': '{:.0f}점'
-                    }),
-                    use_container_width=True, 
-                    height=800,
-                    column_config={
-                        "Price": st.column_config.NumberColumn("현재가", format="%d 원"),
-                        "Summary": st.column_config.TextColumn("분석 요약", width="medium"),
-                        "Name": st.column_config.TextColumn("종목명", width="small")
-                    }
-                )
-
-        if errors:
-            with st.expander("⚠️ 일부 데이터 누락", expanded=False):
-                for e in errors: st.write(e)
-        if not results and not errors: st.error("데이터를 가져오지 못했습니다.")
-    else: st.warning("티커가 없습니다.")
+        final_score
