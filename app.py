@@ -115,27 +115,22 @@ def load_market_data():
         df_krx = fdr.StockListing('KRX')
         df_etf = fdr.StockListing('ETF/KR')
         
-        # --- [KeyError 방어 로직] ---
         if 'Code' not in df_krx.columns and 'Symbol' in df_krx.columns:
             df_krx.rename(columns={'Symbol': 'Code'}, inplace=True)
         
-        # 시가총액 컬럼 확인
         sort_col = 'Marcap' if 'Marcap' in df_krx.columns else 'Close'
         amt_col = 'Amount' if 'Amount' in df_krx.columns else 'Volume'
         
-        # 데이터 정렬 및 추출
         top_cap = df_krx.sort_values(by=sort_col, ascending=False).head(500)
         top_vol = df_krx.sort_values(by=amt_col, ascending=False).head(300)
         df_stocks = pd.concat([top_cap, top_vol]).drop_duplicates(subset=['Code'])
         
-        # ETF 처리
         if 'Symbol' not in df_etf.columns and 'Code' in df_etf.columns:
             df_etf.rename(columns={'Code': 'Symbol'}, inplace=True)
         etf_sort = 'Marcap' if 'Marcap' in df_etf.columns else 'Amount'
         if etf_sort not in df_etf.columns: df_etf[etf_sort] = 0
         df_etf_top = df_etf.sort_values(by=etf_sort, ascending=False).head(50)
         
-        # 섹터 분류
         sectors = {
             "📊 ETF Top 50": [],
             "🚀 반도체/하드웨어": [], "💻 SW/플랫폼/게임": [],
@@ -175,7 +170,6 @@ def load_market_data():
             if any(x in txt for x in ['통신', '텔레콤', 'kt', 'lg유플러스', '네트워크']): return "📡 통신/네트워크"
             return "🌈 기타 대형주"
 
-        # 주식 처리
         for _, row in df_stocks.iterrows():
             code = str(row['Code'])
             name = str(row['Name'])
@@ -186,7 +180,6 @@ def load_market_data():
             else: sectors["🌈 기타 대형주"].append(code)
             ticker_info[code] = {'Name': name}
             
-        # ETF 처리
         for _, row in df_etf_top.iterrows():
             code = str(row['Symbol'])
             name = str(row['Name'])
@@ -238,7 +231,7 @@ def compute_current_factors_safe(ticker):
         return None
 
 # ==============================================================================
-# [백테스트 엔진] (버그 수정됨)
+# [백테스트 엔진] (히스토리 & Next Portfolio 추가)
 # ==============================================================================
 @st.cache_data(ttl=3600*24)
 def fetch_rolling_backtest_data(universe, start_str, end_str):
@@ -261,21 +254,23 @@ def fetch_rolling_backtest_data(universe, start_str, end_str):
             
     return pd.DataFrame(c_dict).ffill(), pd.DataFrame(v_dict).ffill(), kospi
 
-def run_rolling_backtest(prices, volumes, benchmark, weights):
+def run_rolling_backtest(prices, volumes, benchmark, weights, ticker_info_map):
     reb_dates = prices.resample('M').last().index
     start_idx = 0
     for i, d in enumerate(reb_dates):
         if (d - prices.index[0]).days > CONST['WARMUP_DAYS']:
             start_idx = i
             break
-    if start_idx >= len(reb_dates) - 1: return pd.DataFrame()
+            
+    if start_idx >= len(reb_dates) - 1: return pd.DataFrame(), pd.DataFrame()
 
     logs = []
     prev_holdings = set()
     
+    # [1] 과거 시뮬레이션
     for i in range(start_idx, len(reb_dates)-1):
         curr = reb_dates[i]
-        next_d = reb_dates[i+1] # [수정] next_date 변수명 통일 (오타 수정)
+        next_d = reb_dates[i+1] # 변수명 수정됨
         
         p_slice = prices.loc[:curr].tail(int(CONST['WARMUP_DAYS'] * 1.2))
         v_slice = volumes.loc[:curr].tail(int(CONST['WARMUP_DAYS'] * 1.2))
@@ -296,7 +291,6 @@ def run_rolling_backtest(prices, volumes, benchmark, weights):
         top_picks = scored.nlargest(CONST['TOP_N'], 'Total_Score').index.tolist()
         current_holdings = set(top_picks)
         
-        # [수정] next_date -> next_d
         fwd_ret = prices.loc[curr:next_d, top_picks].pct_change().dropna()
         port_ret = (1 + fwd_ret).prod() - 1
         gross = port_ret.mean()
@@ -312,13 +306,43 @@ def run_rolling_backtest(prices, volumes, benchmark, weights):
         bm_period = benchmark.loc[curr:next_d].pct_change().dropna()
         bm_ret = (1 + bm_period).prod() - 1
         
+        # 종목명 변환
+        pick_names = [ticker_info_map.get(x, {}).get('Name', x) for x in top_picks]
+        
         logs.append({
             'Date': next_d, 'Gross': gross, 'Net': net, 'Cost': cost,
-            'BM': bm_ret, 'Alpha': net - bm_ret, 'Turnover': turnover_rate
+            'BM': bm_ret, 'Alpha': net - bm_ret, 'Turnover': turnover_rate,
+            'Holdings': ", ".join(pick_names) # 포트폴리오 저장
         })
         prev_holdings = current_holdings
         
-    return pd.DataFrame(logs)
+    # [2] Next Month Target Portfolio (현재 시점 기준)
+    # 마지막 데이터까지 사용하여 다음 달 추천 포트폴리오 산출
+    p_last = prices.tail(int(CONST['WARMUP_DAYS'] * 1.2))
+    v_last = volumes.tail(int(CONST['WARMUP_DAYS'] * 1.2))
+    
+    rs, rm, tz, vol, mdd = calculate_raw_factors_vectorized(p_last, v_last)
+    
+    factors_last = pd.DataFrame({
+        'ret_short': rs.iloc[-1], 'ret_mid': rm.iloc[-1],
+        'turnover_z': tz.iloc[-1], 'volatility': vol.iloc[-1],
+        'max_drawdown': mdd.iloc[-1]
+    }).dropna()
+    
+    next_portfolio_df = pd.DataFrame()
+    if not factors_last.empty:
+        scored_last = normalize_and_score(factors_last, weights)
+        top_picks_next = scored_last.nlargest(CONST['TOP_N'], 'Total_Score')
+        
+        # UI 표시용 DF 생성
+        next_portfolio_df = top_picks_next[['Total_Score', 'z_ret_short', 'z_turnover_z']].copy()
+        next_portfolio_df.columns = ['점수', '모멘텀(Z)', '수급(Z)']
+        # 인덱스 -> 종목명
+        next_portfolio_df['종목명'] = [ticker_info_map.get(x, {}).get('Name', x) for x in next_portfolio_df.index]
+        next_portfolio_df['종목코드'] = next_portfolio_df.index
+        next_portfolio_df = next_portfolio_df[['종목명', '종목코드', '점수', '모멘텀(Z)', '수급(Z)']]
+        
+    return pd.DataFrame(logs), next_portfolio_df
 
 # ==============================================================================
 # [UI 구성]
@@ -375,44 +399,18 @@ if mode == "📊 실시간 분석":
                 disp = final[['current_price', 'Total_Score', 'ret_short', 'turnover_z', 'max_drawdown']].copy()
                 disp.columns = ['Price', 'Score', 'Mom', 'Liq', 'MDD']
                 
-                # 인덱스를 종목명으로 변경
                 disp.index = [TICKER_INFO.get(x,{}).get('Name',x) for x in disp.index]
-                
-                # 천단위 콤마를 위해 문자열로 변환 (정렬에는 불리하지만 보기 좋음)
-                # 정렬을 유지하고 싶다면 column_config를 써야 하는데, 
-                # Streamlit의 NumberColumn은 천단위 콤마를 기본 지원하지 않음(locale 의존).
-                # 따라서 가장 확실한 방법인 문자열 포맷팅 적용.
                 
                 st.dataframe(
                     disp, 
                     use_container_width=True, 
                     height=600,
                     column_config={
-                        "Price": st.column_config.NumberColumn(
-                            "현재가 (원)", 
-                            format="%d" # 기본 숫자 포맷 (브라우저 로케일에 따라 콤마 들어갈 수 있음)
-                        ),
-                        "Score": st.column_config.ProgressColumn(
-                            "종합 점수", 
-                            format="%.1f점", 
-                            min_value=0, 
-                            max_value=100
-                        ),
-                        "Mom": st.column_config.NumberColumn(
-                            "📈 상승 추세", 
-                            help="최근 1개월 주가 상승 강도 (높을수록 좋음)",
-                            format="%.2f (Z)"
-                        ),
-                        "Liq": st.column_config.NumberColumn(
-                            "🌊 수급 강도",
-                            help="평소 대비 거래 폭발 정도 (2.0 이상이면 강력)",
-                            format="%.2f (Z)"
-                        ),
-                        "MDD": st.column_config.NumberColumn(
-                            "🛡️ 방어력",
-                            help="최근 1년 최대 낙폭 (0%에 가까울수록 안전)",
-                            format="%.1f%%"
-                        )
+                        "Price": st.column_config.NumberColumn("현재가 (원)", format="%d"),
+                        "Score": st.column_config.ProgressColumn("종합 점수", format="%.1f점", min_value=0, max_value=100),
+                        "Mom": st.column_config.NumberColumn("📈 상승 추세", format="%.2f (Z)"),
+                        "Liq": st.column_config.NumberColumn("🌊 수급 강도", format="%.2f (Z)"),
+                        "MDD": st.column_config.NumberColumn("🛡️ 방어력", format="%.1f%%")
                     }
                 )
             else:
@@ -435,7 +433,8 @@ else:
         
         if p_df is not None:
             st.write("연산 수행 중...")
-            res = run_rolling_backtest(p_df, v_df, bm, weights)
+            # TICKER_INFO를 넘겨서 종목명 매핑 수행
+            res, next_port = run_rolling_backtest(p_df, v_df, bm, weights, TICKER_INFO)
             
             if not res.empty:
                 res['Date'] = pd.to_datetime(res['Date'])
@@ -460,21 +459,34 @@ else:
                 fig.add_trace(go.Scatter(x=res.index, y=res['Cum_BM'], name='시장(KOSPI)', line=dict(color='grey', dash='dot')))
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # 결과 테이블 한글화 및 포맷팅
+                # --- [Action Plan] 다음 달 포트폴리오 ---
+                st.divider()
+                st.subheader("📅 이번 달 리밸런싱 타겟 (Action Plan)")
+                st.info("👇 백테스트 로직에 따라, **오늘 당장 매수해야 할 종목**들입니다. (점수순 상위 20개)")
+                
                 st.dataframe(
-                    res,
+                    next_port,
                     use_container_width=True,
                     column_config={
-                        "Gross": st.column_config.NumberColumn("수익률(비용전)", format="%.2%"),
-                        "Net": st.column_config.NumberColumn("수익률(비용후)", format="%.2%"),
-                        "Cost": st.column_config.NumberColumn("비용", format="%.4f"),
-                        "BM": st.column_config.NumberColumn("시장수익률", format="%.2%"),
-                        "Alpha": st.column_config.NumberColumn("초과수익", format="%.2%"),
-                        "Turnover": st.column_config.NumberColumn("교체율", format="%.2%"),
-                        "Cum_Port": st.column_config.NumberColumn("누적(전략)", format="%.2f"),
-                        "Cum_BM": st.column_config.NumberColumn("누적(시장)", format="%.2f")
+                        "점수": st.column_config.ProgressColumn("종합 점수", format="%.1f", min_value=0, max_value=100),
+                        "모멘텀(Z)": st.column_config.NumberColumn(format="%.2f"),
+                        "수급(Z)": st.column_config.NumberColumn(format="%.2f"),
                     }
                 )
+
+                # --- [History] 월별 포트폴리오 이력 ---
+                st.divider()
+                with st.expander("📜 월별 포트폴리오 이력 보기 (클릭)", expanded=False):
+                    st.dataframe(
+                        res[['Gross', 'Net', 'Turnover', 'Holdings']],
+                        use_container_width=True,
+                        column_config={
+                            "Gross": st.column_config.NumberColumn("수익률(전)", format="%.2%"),
+                            "Net": st.column_config.NumberColumn("수익률(후)", format="%.2%"),
+                            "Turnover": st.column_config.NumberColumn("교체율", format="%.2%"),
+                            "Holdings": st.column_config.TextColumn("보유 종목 (당월)", width="large")
+                        }
+                    )
             else:
                 st.error("결과 산출 실패 (데이터 부족)")
         else:
