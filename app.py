@@ -8,13 +8,13 @@ import plotly.graph_objects as go
 import logging
 import FinanceDataReader as fdr
 
-# --- [Log Settings] ---
+# --- [로그 설정] ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# --- [Page Config] ---
-st.set_page_config(page_title="Quant Nexus Pro", layout="wide", initial_sidebar_state="expanded")
+# --- [페이지 설정] ---
+st.set_page_config(page_title="Alpha Seeking Pro", layout="wide", initial_sidebar_state="expanded")
 
-# --- [Styling] ---
+# --- [스타일링] ---
 st.markdown("""
     <style>
     .main { background-color: #0f172a; color: #f8fafc; }
@@ -27,327 +27,359 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- [Constants] ---
-RISK_KEYWORDS = ['유상증자', '횡령', '배임', '상장폐지', '감사의견', '거래정지', '불성실공시']
+# --- [VIX 가져오기] ---
+@st.cache_data(ttl=600)
+def get_vix():
+    try:
+        # 한국 VIX 우선 시도
+        kvix = yf.Ticker("^KS200VIX").history(period="1d")
+        if not kvix.empty:
+            return kvix['Close'].iloc[-1]
+        # 실패시 미국 VIX
+        us_vix = yf.Ticker("^VIX").history(period="1d")
+        if not us_vix.empty:
+            return us_vix['Close'].iloc[-1]
+        return 0.0
+    except: return 0.0
 
-# --- [Data Layer] ---
+# --- [★ 핵심 데이터 로딩 함수 (에러 수정됨)] ---
 @st.cache_data(ttl=3600*12)
 def load_market_data():
+    # 1. KRX 전체 종목 (코스피+코스닥)
     df_krx = fdr.StockListing('KRX')
+    
+    # 2. 한국 ETF 전체
     df_etf = fdr.StockListing('ETF/KR')
     
-    # KOSPI 200 + KOSDAQ 100 filtering by Marcap
+    # --- 주식 필터링 (시총 상위) ---
+    # 컬럼명이 'Marcap'이 없는 경우를 대비해 'Close' 등으로 대체 정렬
     sort_col = 'Marcap' if 'Marcap' in df_krx.columns else 'Close'
+    
+    # 코스피 200개
     df_kospi = df_krx[df_krx['Market'] == 'KOSPI'].sort_values(by=sort_col, ascending=False).head(200)
+    # 코스닥 100개
     df_kosdaq = df_krx[df_krx['Market'] == 'KOSDAQ'].sort_values(by=sort_col, ascending=False).head(100)
+    
     df_stocks = pd.concat([df_kospi, df_kosdaq])
     
-    # ETF Top 50
-    etf_sort_col = 'Marcap' if 'Marcap' in df_etf.columns else 'Amount'
-    df_etf_top = df_etf.sort_values(by=etf_sort_col, ascending=False).head(50)
+    # --- ETF 필터링 (시총 상위 50개) ---
+    # ETF 데이터셋은 Marcap 컬럼이 없을 수 있음 -> 거래대금(Amount) 순으로 대체 가능
+    etf_sort = 'Marcap' if 'Marcap' in df_etf.columns else ('Amount' if 'Amount' in df_etf.columns else 'Price')
+    df_etf_top = df_etf.sort_values(by=etf_sort, ascending=False).head(50)
 
-    # Sector Classification
+    # --- 섹터 초기화 ---
     sectors = {
-        "📊 Top 50 ETFs": [],
-        "🚀 Semiconductor & IT": [],
-        "🔋 Battery & Chemicals": [],
-        "💊 Pharma & Biotech": [],
-        "💰 Finance & Value-up": [],
-        "🚗 Auto & Transport": [],
-        "🛡️ Defense/Ship/Infra": [],
-        "💄 Consumer/Food/Ent": [],
-        "🎮 Platform & Game": [],
-        "🌈 Other Large Caps": []
+        "📊 시가총액 상위 ETF (Top 50)": [],
+        "🚀 반도체 & IT": [],
+        "🔋 2차전지 & 화학": [],
+        "💊 제약 & 바이오": [],
+        "💰 금융 (지주/증권/은행)": [],
+        "🚗 자동차 & 운송": [],
+        "🛡️ 방산/조선/전력/건설": [],
+        "💄 소비재 (화장품/식품/엔터)": [],
+        "🎮 플랫폼 & 게임 & 통신": [],
+        "🏙️ 코스닥 우량주 (바이오/IT 외)": [],
+        "🌈 기타 대형주": []
     }
     
     ticker_name_map = {}
 
+    # --- 통합 처리 함수 (컬럼명 자동 감지) ---
     def process_tickers(df, is_etf=False):
+        # [수정 포인트] 데이터 소스마다 종목코드 컬럼명이 다름 ('Code' vs 'Symbol')
+        if 'Code' in df.columns:
+            code_col = 'Code'
+        elif 'Symbol' in df.columns:
+            code_col = 'Symbol'
+        else:
+            return # 컬럼이 없으면 스킵
+
         has_sector = 'Sector' in df.columns
+        has_industry = 'Industry' in df.columns
+        
         for _, row in df.iterrows():
-            code = str(row['Symbol'])
+            code = str(row[code_col]) # 동적 컬럼명 사용
             name = str(row['Name'])
-            suffix = ".KS" if is_etf or (row.get('Market', 'KOSPI') == 'KOSPI') else ".KQ"
+            
+            # 티커 접미사 처리
+            if is_etf:
+                suffix = ".KS" # ETF는 대부분 코스피 상장 취급
+            else:
+                market = row.get('Market', 'KOSPI')
+                suffix = ".KS" if market == 'KOSPI' else ".KQ"
+
             yf_ticker = code + suffix
             ticker_name_map[yf_ticker] = name
             
+            # 1. ETF 분류
             if is_etf:
-                sectors["📊 Top 50 ETFs"].append(yf_ticker)
+                sectors["📊 시가총액 상위 ETF (Top 50)"].append(yf_ticker)
                 continue
 
-            combined_text = (name + " " + (str(row['Sector']) if has_sector and pd.notnull(row['Sector']) else "")).lower()
+            # 2. 주식 키워드 분류
+            sector_val = str(row['Sector']) if has_sector and pd.notnull(row['Sector']) else ""
+            industry_val = str(row['Industry']) if has_industry and pd.notnull(row['Industry']) else ""
+            combined_text = (name + " " + sector_val + " " + industry_val).lower()
             
-            if any(x in combined_text for x in ['semiconductor', 'elec', 'sk hynix', 'samsung el', 'hpsp']): sectors["🚀 Semiconductor & IT"].append(yf_ticker)
-            elif any(x in combined_text for x in ['battery', 'chem', 'energy', 'ecopro', 'posco fut', 'kumyang']): sectors["🔋 Battery & Chemicals"].append(yf_ticker)
-            elif any(x in combined_text for x in ['pharma', 'bio', 'life', 'alteogen', 'hlb']): sectors["💊 Pharma & Biotech"].append(yf_ticker)
-            elif any(x in combined_text for x in ['finance', 'bank', 'insur', 'meritz', 'kb', 'shinhan']): sectors["💰 Finance & Value-up"].append(yf_ticker)
-            elif any(x in combined_text for x in ['auto', 'motor', 'kia', 'hyundai', 'ship', 'air']): sectors["🚗 Auto & Transport"].append(yf_ticker)
-            elif any(x in combined_text for x in ['heavy', 'defense', 'power', 'hanwha', 'rotem', 'lignex1']): sectors["🛡️ Defense/Ship/Infra"].append(yf_ticker)
-            elif any(x in combined_text for x in ['food', 'cosmetic', 'ent', 'hybe', 'amore']): sectors["💄 Consumer/Food/Ent"].append(yf_ticker)
-            elif any(x in combined_text for x in ['soft', 'game', 'internet', 'naver', 'kakao', 'krafton']): sectors["🎮 Platform & Game"].append(yf_ticker)
-            else: sectors["🌈 Other Large Caps"].append(yf_ticker)
+            if any(x in combined_text for x in ['반도체', '전자', '디스플레이', 'sk하이닉스', 'hpsp', '리노', '이수페타시스', '가온칩스', '삼성전자']):
+                sectors["🚀 반도체 & IT"].append(yf_ticker)
+            elif any(x in combined_text for x in ['전지', '화학', '에너지', '에코프로', '포스코퓨처', '금양', '엘앤에프', '캠']):
+                sectors["🔋 2차전지 & 화학"].append(yf_ticker)
+            elif any(x in combined_text for x in ['제약', '바이오', '생명', '헬스', '알테오젠', 'hlb', '셀트리온', '삼천당', '리가켐']):
+                sectors["💊 제약 & 바이오"].append(yf_ticker)
+            elif any(x in combined_text for x in ['금융', '지주', '은행', '증권', '보험', '메리츠', '기업은행', '삼성생명']):
+                sectors["💰 금융 (지주/증권/은행)"].append(yf_ticker)
+            elif any(x in combined_text for x in ['자동차', '부품', '에어', '항공', '해운', '글로비스', '기아', '현대차', '모비스']):
+                sectors["🚗 자동차 & 운송"].append(yf_ticker)
+            elif any(x in combined_text for x in ['중공업', '방산', '기계', '전력', '전선', '건설', '조선', '한화', '현대일렉', '로템']):
+                sectors["🛡️ 방산/조선/전력/건설"].append(yf_ticker)
+            elif any(x in combined_text for x in ['식품', '음료', '화장품', '엔터', '투어', '쇼핑', 'f&b', '하이브', '푸드', '아모레', 'cj']):
+                sectors["💄 소비재 (화장품/식품/엔터)"].append(yf_ticker)
+            elif any(x in combined_text for x in ['소프트웨어', '게임', '통신', '서비스', '인터넷', '네이버', '카카오', '크래프톤', '텔레콤']):
+                sectors["🎮 플랫폼 & 게임 & 통신"].append(yf_ticker)
+            elif suffix == ".KQ": # 코스닥인데 위 카테고리에 안 걸린 우량주
+                sectors["🏙️ 코스닥 우량주 (바이오/IT 외)"].append(yf_ticker)
+            else:
+                sectors["🌈 기타 대형주"].append(yf_ticker)
 
+    # 실행
     process_tickers(df_stocks, is_etf=False)
     process_tickers(df_etf_top, is_etf=True)
+
     return sectors, ticker_name_map
 
-with st.spinner("Initializing Quant Engine..."):
+# --- [데이터 로딩] ---
+with st.spinner("시장 데이터(코스피/코스닥/ETF) 분석 중... (약 15초 소요)"):
     SECTORS, TICKER_MAP = load_market_data()
 
-# --- [Factor Layer] ---
-def compute_factors(df):
-    """
-    Computes raw factor values from price history.
-    """
-    if len(df) < 60: return None
-    
-    # 1. Momentum Factors
-    # Price Momentum: recent strength
-    ret20 = df['Close'].pct_change(20).iloc[-1]  # 1 Month Return
-    ret60 = df['Close'].pct_change(60).iloc[-1]  # 3 Month Return
-    
-    # 2. Liquidity Factors
-    # Turnover Z (Time-series): How is today's volume compared to avg?
-    turnover = df['Volume'] * df['Close']
-    turnover_z = (turnover.iloc[-1] - turnover.mean()) / (turnover.std() + 1e-9)
-    
-    # 3. Risk Factors
-    # MDD (Max Drawdown): Downside risk
-    cummax = df['Close'].cummax()
-    drawdown = (df['Close'] / cummax) - 1
-    mdd = drawdown.min() # Should be negative
-    
-    # Volatility (Annualized)
-    vol = df['Close'].pct_change().std() * np.sqrt(252)
-    
-    return {
-        "ret20": ret20,
-        "ret60": ret60,
-        "turnover_z": turnover_z,
-        "mdd": mdd,
-        "vol": vol,
-        "current_price": df['Close'].iloc[-1],
-        "chart_data": df['Close'].tail(60)
-    }
+# --- [헬퍼 함수들] ---
+def get_stock_name(ticker):
+    return TICKER_MAP.get(ticker, ticker)
 
-# --- [Risk Layer] ---
-def check_event_risk(ticker):
-    """
-    Checks for critical risk keywords in recent news.
-    """
+def get_news_sentiment(ticker):
     try:
         stock = yf.Ticker(ticker)
         news = stock.news
-        if not news: return False, []
-        
-        detected_risks = []
+        if not news: return 0
+        pos_words = ['체결', '수주', '흑자', '개발', '승인', '제휴', '공급', 'M&A', '협력', '상향']
+        neg_words = ['적자', '소송', '해지', '반려', '거절', '횡령', '배임', '하향', '유상증자']
+        score = 0
         for article in news[:3]:
             title = article.get('title', '').lower()
-            # YFinance news is often English, but we check provided KR keywords just in case
-            # + English equivalents
-            for k in RISK_KEYWORDS:
-                if k in title: detected_risks.append(k)
+            for pw in pos_words:
+                if pw in title: score += 5
+            for nw in neg_words:
+                if nw in title: score -= 5
+        return max(-10, min(10, score))
+    except: return 0
+
+def calculate_indicators(hist):
+    # MACD
+    ema12 = hist['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = hist['Close'].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal_line = macd.ewm(span=9, adjust=False).mean()
+    # BB
+    sma20 = hist['Close'].rolling(window=20).mean()
+    std20 = hist['Close'].rolling(window=20).std()
+    upper_band = sma20 + (std20 * 2)
+    lower_band = sma20 - (std20 * 2)
+    # SMA
+    sma120 = hist['Close'].rolling(window=120).mean()
+    sma50 = hist['Close'].rolling(window=50).mean()
+    sma20 = hist['Close'].rolling(window=20).mean()
+    sma5 = hist['Close'].rolling(window=5).mean()
+    # CCI
+    tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
+    sma_tp = tp.rolling(window=20).mean()
+    mad = (tp - sma_tp).abs().rolling(window=20).mean()
+    cci = (tp - sma_tp) / (0.015 * mad)
+    
+    return macd, signal_line, upper_band, sma120, sma50, sma20, sma5, cci
+
+def fetch_stock_data(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1y")
+        if hist.empty or len(hist) < 120: return {"error": f"{ticker}: 데이터 부족"}
+
+        cur_price = hist['Close'].iloc[-1]
+        prev_close = hist['Close'].iloc[-2]
+        day_chg = ((cur_price - prev_close) / prev_close) * 100
+        vol_avg = hist['Volume'].rolling(20).mean().iloc[-1]
+        rvol = (hist['Volume'].iloc[-1] / vol_avg) if vol_avg > 0 else 0
+        
+        delta = hist['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rsi = 100 if loss.iloc[-1] == 0 else 100 - (100 / (1 + gain.iloc[-1] / loss.iloc[-1]))
+        
+        macd, signal_line, upper_band, sma120, sma50, sma20, sma5, cci = calculate_indicators(hist)
+        
+        cur_macd, cur_signal = macd.iloc[-1], signal_line.iloc[-1]
+        cur_upper = upper_band.iloc[-1]
+        cur_sma120 = sma120.iloc[-1]
+        cur_sma50, prev_sma50 = sma50.iloc[-1], sma50.iloc[-2]
+        cur_sma20, prev_sma20 = sma20.iloc[-1], sma20.iloc[-2]
+        cur_sma5, prev_sma5 = sma5.iloc[-1], sma5.iloc[-2]
+        cur_cci = cci.iloc[-1]
+
+        score = 0
+        reasons = [] 
+        
+        # 1. 추세
+        if cur_price >= cur_sma120: score += 20; reasons.append("장기정배열")
+        else: score -= 10
+        
+        # 2. 골든크로스
+        is_short_gc = (prev_sma5 < prev_sma20) and (cur_sma5 >= cur_sma20)
+        if is_short_gc: score += 20; reasons.append("단기골든크로스")
+        elif cur_sma5 > cur_sma20: score += 10
+        
+        is_mid_gc = (prev_close < prev_sma50) and (cur_price >= cur_sma50)
+        if is_mid_gc: score += 15; reasons.append("50일선돌파")
+        elif cur_price >= cur_sma50: score += 5
+        
+        # 3. 보조지표
+        if cur_macd > cur_signal: score += 10
+        if cur_cci < -100: score += 10; reasons.append("CCI침체")
+        
+        # 4. RSI
+        if rsi <= 35: score += 15; reasons.append("RSI과매도")
+        elif 40 <= rsi <= 65: score += 5
+        elif rsi >= 75: score -= 15; reasons.append("RSI과열")
+
+        # 5. 기타
+        vix = get_vix()
+        if vix > 25: score -= 10
+        news_score = get_news_sentiment(ticker)
+        score += news_score
+        if news_score > 0: reasons.append("호재뉴스")
+        if rvol > 1.5: score += 5
+
+        score = max(0, min(100, score))
+        
+        signal = "⚖️ 중립 (관망)"
+        if rsi >= 80 or cur_price > cur_upper * 1.05:
+            signal = "🔥 과열 (진입금지)"
+            reasons.insert(0, "단기급등")
+        elif is_mid_gc or is_short_gc:
+            signal = "✨ 추세전환 시도"
+        elif score >= 75:
+            signal = "🚀 강력 매수"
+        elif score >= 60:
+            signal = "👍 매수"
+        elif score <= 35:
+            signal = "⚠️ 매도/관망"
             
-            # English risk keywords for Yahoo Finance
-            en_risks = ['embezzle', 'delisting', 'suspension', 'audit', 'breach']
-            for k in en_risks:
-                if k in title: detected_risks.append(k)
-                
-        if detected_risks:
-            return True, list(set(detected_risks))
-        return False, []
-    except:
-        return False, []
+        reason_str = ", ".join(reasons) if reasons else "-"
 
-# --- [Scoring Layer] ---
-def cross_sectional_score(factor_df):
-    """
-    Calculates Z-scores across the universe and computes final weighted score.
-    Logic: High Momentum + High Liquidity - High Risk
-    """
-    if factor_df.empty: return factor_df
-    
-    # Standardize (Z-Score)
-    # (x - mean) / std -> converts absolute values to relative ranking (sigma)
-    z = (factor_df - factor_df.mean()) / (factor_df.std() + 1e-9)
-    
-    # Weighted Score Formula
-    # Momentum (60%) + Liquidity (20%) - Risk (20%)
-    # Note: MDD is negative, so we ADD it to penalize deep drawdowns? 
-    # Usually: Higher MDD (closer to 0) is better. Lower MDD (e.g. -50%) is worse.
-    # Z-score of -50% MDD will be low (negative). Z-score of -5% MDD will be high (positive).
-    # So we want High Z(MDD).
-    # Volatility: High Vol is bad. We want Low Vol. So we subtract Z(Vol).
-    
-    final_score = (
-        z['ret20'] * 0.3 +       # Short-term Mom
-        z['ret60'] * 0.3 +       # Mid-term Mom
-        z['turnover_z'] * 0.2 +  # Liquidity Shock
-        z['mdd'] * 0.1 -         # Drawdown stability (Higher is better)
-        z['vol'] * 0.1           # Volatility (Lower is better)
-    )
-    
-    # Scaling to 0-100 for UI friendliness (Sigmoid-like scaling or MinMax)
-    # Using Simple MinMax for readability 0 to 100
-    min_scr = final_score.min()
-    max_scr = final_score.max()
-    scaled_score = ((final_score - min_scr) / (max_scr - min_scr + 1e-9)) * 100
-    
-    return scaled_score, z
+        return {
+            "Ticker": ticker, "Name": get_stock_name(ticker),
+            "Price": cur_price, "Change": day_chg,
+            "RVOL": rvol, "RSI": rsi, "CCI": cur_cci,
+            "Score": score, "Signal": signal, "Summary": reason_str,
+            "chart_data": hist['Close'].tail(60), "SMA50_Cross": is_mid_gc
+        }
+    except Exception as e: return {"error": f"{ticker}: {str(e)}"}
 
-# --- [Execution Engine] ---
-def run_quant_analysis(tickers):
-    results = {}
-    risks = {}
-    
-    def worker(ticker):
-        try:
-            # 1. Fetch Data
-            df = yf.Ticker(ticker).history(period="6mo") # 6 months needed for ret60
-            
-            # 2. Risk Check
-            is_risky, risk_factors = check_event_risk(ticker)
-            if is_risky:
-                risks[ticker] = risk_factors
-                # We typically exclude risky stocks or penalize them heavily
-                return None 
-            
-            # 3. Compute Factors
-            factors = compute_factors(df)
-            if factors:
-                return {**factors, 'ticker': ticker}
-        except:
-            return None
-            
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(worker, t): t for t in tickers}
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res:
-                results[res['ticker']] = res
-
-    if not results:
-        return pd.DataFrame(), risks
-
-    # Create Factor DataFrame
-    factor_df = pd.DataFrame.from_dict(results, orient='index')
-    
-    # 4. Cross Sectional Scoring
-    # Only calculate z-scores on numeric columns
-    numeric_cols = ['ret20', 'ret60', 'turnover_z', 'mdd', 'vol']
-    scores, z_scores = cross_sectional_score(factor_df[numeric_cols])
-    
-    factor_df['Quant Score'] = scores
-    
-    # Add Z-scores for detailed view (optional)
-    factor_df['Z-Mom'] = (z_scores['ret20'] + z_scores['ret60']) / 2
-    factor_df['Z-Risk'] = (z_scores['mdd'] * -1 + z_scores['vol']) / 2 # High means High Risk
-    
-    return factor_df.sort_values(by='Quant Score', ascending=False), risks
-
-# --- [Web UI] ---
-st.title("🛡️ Quant Nexus Pro")
-st.caption("Cross-Sectional Factor Scoring Model (Momentum / Liquidity / Risk)")
+# --- [웹 UI 구성] ---
+st.title("🛡️ Alpha Seeking Pro (Auto)")
 
 with st.sidebar:
-    st.header("Strategy Settings")
-    view_mode = st.radio("View Mode", ["📱 Card View", "💻 Table View"], horizontal=True)
+    st.header("🎯 타겟 설정")
+    view_mode = st.radio("화면 모드", ["📱 모바일 카드", "💻 PC 테이블"], horizontal=True)
+    st.divider()
+    
+    tab1, tab2 = st.tabs(["📂 자동 분류 섹터", "⌨️ 직접 입력"])
+    with tab1:
+        st.info("KOSPI 200 / KOSDAQ 100 / ETF 50 자동 분석")
+        selected_sector = st.selectbox("분석할 섹터를 선택하세요", list(SECTORS.keys()))
+    with tab2:
+        st.info("예시: 005930.KS, 000660.KS")
+        custom_input = st.text_area("티커 입력", height=100)
     
     st.divider()
-    selected_sector = st.selectbox("Universe Selection", list(SECTORS.keys()))
-    
-    st.divider()
-    st.markdown("### ⚙️ Algorithm Logic")
-    st.info("""
-    **1. Scoring (Z-Score)**
-    - Momentum (60%): 1M/3M Return
-    - Liquidity (20%): Turnover Burst
-    - Risk (20%): Volatility & MDD
-    
-    **2. Risk Filter**
-    - Excludes: Embezzlement, Delisting, Suspension events.
-    """)
-    
-    scan_button = st.button("🚀 Run Quant Engine", type="primary", use_container_width=True)
+    scan_button = st.button("📊 분석 시작 (START)", type="primary", use_container_width=True)
 
 if scan_button:
-    target_tickers = SECTORS[selected_sector]
+    target_tickers = [t.strip() for t in custom_input.split(',') if t.strip()] if custom_input.strip() else SECTORS[selected_sector]
     
-    st.subheader(f"📊 Analysis: {selected_sector}")
+    if len(target_tickers) > 60:
+        st.info(f"선택하신 섹터의 종목 수({len(target_tickers)}개)가 많아 분석에 시간이 소요됩니다.")
     
-    progress_bar = st.progress(0, text="Fetching Market Data...")
+    st.subheader(f"🔍 {selected_sector if not custom_input.strip() else '커스텀'} 분석")
     
-    # Run Engine
-    df_result, risk_dict = run_quant_analysis(target_tickers)
-    
-    progress_bar.progress(100, text="Calculation Complete.")
-    time.sleep(0.5)
-    progress_bar.empty()
-    
-    if not df_result.empty:
-        # Summary Metrics
-        c1, c2, c3, c4 = st.columns(4)
-        top_pick = df_result.iloc[0]
-        name = TICKER_MAP.get(top_pick.name, top_pick.name)
+    if len(target_tickers) > 0:
+        results = []
+        errors = []
+        my_bar = st.progress(0, text=f"데이터 정밀 분석 중... (총 {len(target_tickers)}개)")
         
-        c1.metric("Universe Size", f"{len(df_result)} Stocks")
-        c2.metric("Top Pick (No.1)", name)
-        c3.metric("Avg Score", f"{df_result['Quant Score'].mean():.1f}")
-        c4.metric("Risk Filtered", f"{len(risk_dict)}")
+        # 스레드 최적화 (5개)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_ticker = {executor.submit(fetch_stock_data, t): t for t in target_tickers}
+            for i, future in enumerate(concurrent.futures.as_completed(future_to_ticker)):
+                res = future.result()
+                if res and "error" in res: errors.append(res['error'])
+                elif res: results.append(res)
+                my_bar.progress((i + 1) / len(target_tickers))
+        my_bar.empty()
 
-        # --- Card View ---
-        if "Card" in view_mode:
-            st.caption("Top 10 Ranked Stocks based on Factor Z-Scores")
-            for idx, row in df_result.head(10).iterrows():
-                stock_name = TICKER_MAP.get(idx, idx)
-                score = row['Quant Score']
-                
-                # Dynamic Color based on Score
-                if score >= 80: border_color = "🔴 Strong Buy"
-                elif score >= 60: border_color = "🟡 Buy"
-                else: border_color = "⚪ Hold"
-                
-                with st.expander(f"{border_color} | {stock_name} ({idx}) | Score: {score:.0f}", expanded=False):
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Momentum (1M)", f"{row['ret20']*100:.1f}%")
-                    c2.metric("Risk (MDD)", f"{row['mdd']*100:.1f}%")
-                    c3.metric("Liq Z-Score", f"{row['turnover_z']:.2f}")
-                    
-                    # Mini Chart
-                    fig = go.Figure()
-                    color = '#ef4444' if row['ret20'] > 0 else '#3b82f6'
-                    fig.add_trace(go.Scatter(y=row['chart_data'], mode='lines', line=dict(color=color, width=2)))
-                    fig.update_layout(height=150, margin=dict(t=10,b=10,l=10,r=10), template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)')
-                    fig.update_xaxes(visible=False) 
-                    st.plotly_chart(fig, use_container_width=True)
-
-        # --- Table View ---
-        else:
-            # Format DataFrame for Display
-            display_df = df_result[['current_price', 'ret20', 'ret60', 'mdd', 'turnover_z', 'Quant Score']].copy()
-            display_df.columns = ['Price', 'Mom(1M)', 'Mom(3M)', 'MDD', 'Liq(Z)', 'Score']
-            display_df.index = [TICKER_MAP.get(x, x) for x in display_df.index]
+        if results:
+            df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
             
-            st.dataframe(
-                display_df.style.background_gradient(subset=['Score'], cmap='RdYlGn')
-                .format({
-                    'Price': '{:,.0f}', 
-                    'Mom(1M)': '{:+.1%}', 
-                    'Mom(3M)': '{:+.1%}', 
-                    'MDD': '{:.1%}', 
-                    'Liq(Z)': '{:.2f}', 
-                    'Score': '{:.1f}'
-                }),
-                use_container_width=True,
-                height=600
-            )
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("분석 종목", f"{len(df)}개")
+            c2.metric("50일선 돌파", f"{len(df[df['SMA50_Cross']])}개")
+            c3.metric("평균 수익률", f"{df['Change'].mean():.2f}%")
+            # [수정] VIX 라벨 명확화
+            c4.metric("한국 공포지수(K-VIX)", f"{get_vix():.2f}")
 
-        # Risk Report
-        if risk_dict:
-            with st.expander("⚠️ Risk Alert (Excluded Stocks)", expanded=True):
-                for t, r in risk_dict.items():
-                    name = TICKER_MAP.get(t, t)
-                    st.error(f"**{name} ({t})**: Detected keywords {r}")
+            if "모바일" in view_mode:
+                st.caption("💡 카드를 누르면 상세 차트가 펼쳐집니다.")
+                for idx, row in df.iterrows():
+                    header_icon = "✨" if row['SMA50_Cross'] else ("🔥" if "과열" in row['Signal'] else ("🚀" if "강력" in row['Signal'] else "📊"))
+                    with st.expander(f"{header_icon} {row['Name']} | {row['Signal']} ({row['Change']:+.2f}%)", expanded=False):
+                        st.markdown(f"**📌 요약:** :blue[{row['Summary']}]")
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("점수", f"{row['Score']:.0f}")
+                        m2.metric("현재가", f"{row['Price']:,.0f}")
+                        m3.metric("RSI", f"{row['RSI']:.0f}")
+                        m4.metric("RVOL", f"{row['RVOL']:.1f}")
+                        
+                        fig = go.Figure()
+                        color = '#ef4444' if row['Change'] > 0 else '#3b82f6'
+                        fig.add_trace(go.Scatter(x=row['chart_data'].index, y=row['chart_data'], mode='lines', line=dict(color=color, width=2)))
+                        fig.update_layout(height=180, margin=dict(t=10,b=10,l=10,r=10), template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', font=dict(color="white"))
+                        st.plotly_chart(fig, use_container_width=True)
 
-    else:
-        st.error("No valid data found or all stocks filtered by risk.")
+            else:
+                df_display = df.drop(columns=['chart_data', 'SMA50_Cross'])
+                def color_signal(val):
+                    if '강력' in val: return 'color: #ef4444; font-weight: bold'
+                    if '전환' in val: return 'color: #f59e0b; font-weight: bold'
+                    if '매수' in val: return 'color: #facc15'
+                    if '과열' in val: return 'color: #dc2626'
+                    if '매도' in val: return 'color: #3b82f6'
+                    if '중립' in val: return 'color: #94a3b8'
+                    return 'color: white'
+
+                st.dataframe(
+                    df_display.style.map(color_signal, subset=['Signal']).format({
+                        'Price': '{:,.0f} 원', 'Change': '{:+.2f}%', 
+                        'RSI': '{:.0f}', 'CCI': '{:.0f}', 'RVOL': '{:.1f}x', 'Score': '{:.0f}점'
+                    }),
+                    use_container_width=True, 
+                    height=800,
+                    column_config={
+                        "Price": st.column_config.NumberColumn("현재가", format="%d 원"),
+                        "Summary": st.column_config.TextColumn("분석 요약", width="medium"),
+                        "Name": st.column_config.TextColumn("종목명", width="small")
+                    }
+                )
+
+        if errors:
+            with st.expander("⚠️ 일부 데이터 누락", expanded=False):
+                for e in errors: st.write(e)
+        if not results and not errors: st.error("데이터를 가져오지 못했습니다.")
+    else: st.warning("티커가 없습니다.")
