@@ -14,7 +14,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Master Final)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -25,6 +25,21 @@ st.markdown("""
     [data-testid="stMetricValue"] { color: #f8fafc !important; font-size: 1.1rem !important; }
     </style>
     """, unsafe_allow_html=True)
+
+# ==============================================================================
+# [설정 & 상수]
+# ==============================================================================
+CONST = {
+    'TRADING_DAYS': 252,       
+    'MOM_SHORT': 20,           
+    'MOM_MID': 60,             
+    'VOL_WINDOW': 252,         
+    'COST_RATE': 0.002,        
+    'TOP_N': 20,               
+    'BACKTEST_YEARS': 10,      
+    'WARMUP_DAYS': 300,
+    'MIN_AMT': 5_000_000_000   # Default (KR)
+}
 
 # ==============================================================================
 # [공통 로직: 팩터 계산 & 랭킹]
@@ -133,15 +148,19 @@ def load_us_data(index_name='S&P 500'):
 @st.cache_data(ttl=3600*24)
 def fetch_data_kr(universe, days=365*10):
     start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    # [수정] 벤치마크 로딩 안정화
-    kospi = fdr.DataReader('KS11', start)['Close']
-    kospi.index = pd.to_datetime(kospi.index).tz_localize(None) # TZ 제거
-    
+    try:
+        kospi = fdr.DataReader('KS11', start)['Close']
+        kospi.index = pd.to_datetime(kospi.index)
+        if kospi.index.tz is not None: kospi.index = kospi.index.tz_localize(None)
+    except: kospi = pd.Series(dtype=float)
+
     p, v = {}, {}
     def get(code):
         try:
             d = fdr.DataReader(code, start)
             if d.empty: return None
+            d.index = pd.to_datetime(d.index)
+            if d.index.tz is not None: d.index = d.index.tz_localize(None)
             return code, d['Close'], d['Volume']
         except: return None
 
@@ -156,38 +175,134 @@ def fetch_data_kr(universe, days=365*10):
 @st.cache_data(ttl=3600*24)
 def fetch_data_us(universe, days=365*10):
     start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    
-    # [수정] 벤치마크 로딩 안정화
-    bm = yf.download("^GSPC", start=start, progress=False)['Close']
-    bm.index = pd.to_datetime(bm.index).tz_localize(None) # TZ 제거
-    
+    try:
+        bm = yf.download("^GSPC", start=start, progress=False)['Close']
+        bm.index = pd.to_datetime(bm.index)
+        if bm.index.tz is not None: bm.index = bm.index.tz_localize(None)
+    except: bm = pd.Series(dtype=float)
+
     try:
         d = yf.download(universe, start=start, group_by='ticker', progress=False, threads=True)
         p, v = pd.DataFrame(), pd.DataFrame()
-        for t in universe:
-            if t in d.columns.levels[0]:
-                col = 'Adj Close' if 'Adj Close' in d[t] else 'Close'
-                p[t] = d[t][col]
-                v[t] = d[t]['Volume']
-        
-        # 인덱스 TZ 제거
-        p.index = pd.to_datetime(p.index).tz_localize(None)
-        v.index = pd.to_datetime(v.index).tz_localize(None)
-        
+        if isinstance(d.columns, pd.MultiIndex):
+            tickers = d.columns.levels[0]
+            for t in tickers:
+                if t in universe:
+                    if 'Adj Close' in d[t]: series = d[t]['Adj Close']
+                    elif 'Close' in d[t]: series = d[t]['Close']
+                    else: continue
+                    vol = d[t]['Volume'] if 'Volume' in d[t] else None
+                    
+                    series.index = pd.to_datetime(series.index)
+                    if series.index.tz is not None: series.index = series.index.tz_localize(None)
+                    if vol is not None:
+                        vol.index = pd.to_datetime(vol.index)
+                        if vol.index.tz is not None: vol.index = vol.index.tz_localize(None)
+                    p[t], v[t] = series, vol
         return p, v, bm
     except: return pd.DataFrame(), pd.DataFrame(), bm
 
 # ==============================================================================
+# [★ 핵심 백테스트 엔진 (Realistic)]
+# ==============================================================================
+def run_backtest(prices, volumes, benchmark, weights, ticker_map):
+    # 데이터가 충분한지 확인
+    if prices.empty: return pd.DataFrame()
+
+    # 월말 리밸런싱 날짜 산출 (실제 거래일 기준)
+    reb_dates = prices.groupby(pd.Grouper(freq='M')).apply(lambda x: x.index[-1])
+    
+    logs = []
+    start_idx = 12 # 1년치 웜업
+    
+    # [수정 2] 리밸런싱 루프 개선
+    for i in range(start_idx, len(reb_dates)-1):
+        signal_date = reb_dates[i]      # 신호 발생일 (월말)
+        next_signal = reb_dates[i+1]    # 다음 리밸런싱일
+        
+        # 1. 팩터 계산을 위한 데이터 슬라이싱 (신호 발생일 기준)
+        p_sub = prices.loc[:signal_date].tail(300)
+        v_sub = volumes.loc[:signal_date].tail(300)
+        
+        # 유효 종목 필터링
+        active_tickers = p_sub.columns[p_sub.iloc[-1].notna()]
+        
+        daily_factors = []
+        for t in active_tickers:
+            f = calculate_factors(p_sub[t], v_sub[t], CONST['MIN_AMT'])
+            if f:
+                f['code'] = t
+                daily_factors.append(f)
+                
+        if not daily_factors: continue
+        
+        # 2. 랭킹 산출 및 종목 선정
+        factor_df = pd.DataFrame(daily_factors).set_index('code')
+        ranked = rank_and_score(factor_df, weights)
+        picks = ranked.head(CONST['TOP_N']).index.tolist()
+        
+        if not picks: continue
+
+        # [수정 2] 매수 타이밍 현실화 (Next Trading Day)
+        # prices.index에서 signal_date 바로 다음 날짜를 찾음
+        try:
+            # signal_date 다음의 거래일 인덱스 찾기
+            loc = prices.index.get_loc(signal_date)
+            if loc + 1 >= len(prices.index): continue # 데이터 끝이면 스킵
+            
+            entry_date = prices.index[loc + 1] # T+1일 매수
+            
+            # 수익률 계산 구간: 매수일(Entry) ~ 다음 리밸런싱일(Next Signal)
+            # pct_change()는 (오늘/어제)-1 이므로, 
+            # entry_date부터 잘라내면 첫 행은 NaN이 됨 (entry_date의 수익률은 모름/보유전)
+            # 따라서 entry_date:next_signal 구간을 자르고 pct_change 한 뒤 dropna하면
+            # entry_date 다음날부터의 수익률이 남음. (정확히 T+1 종가 매수 시뮬레이션)
+            period_price = prices.loc[entry_date:next_signal, picks]
+            
+            if period_price.empty: continue
+            
+            period_daily_rets = period_price.pct_change().dropna()
+            
+        except KeyError: continue
+
+        # [수정 1] 포트폴리오 수익률 정밀 계산 (Daily Equal Weight -> Compound)
+        if not period_daily_rets.empty:
+            # 1. 일별 포트폴리오 수익률 (종목들의 등가중 평균)
+            # 가정: 매일 장마감 시 리밸런싱하여 비중을 1/N로 맞춤 (일반적인 근사치)
+            port_daily_ret = period_daily_rets.mean(axis=1)
+            
+            # 2. 기간 누적 수익률 (복리 계산)
+            port_period_ret = (1 + port_daily_ret).prod() - 1
+            
+            # 3. 비용 차감 (리밸런싱 1회당 발생 가정)
+            net_ret = port_period_ret - CONST['COST_RATE']
+            
+            # 벤치마크 수익률 (동일 기간)
+            try:
+                bm_slice = benchmark.loc[entry_date:next_signal]
+                bm_ret = (bm_slice.iloc[-1] / bm_slice.iloc[0]) - 1
+            except: bm_ret = 0.0
+            
+            logs.append({
+                'Date': next_signal,
+                'Port_Ret': net_ret,
+                'BM_Ret': bm_ret,
+                'Top1_Holding': TICKER_INFO.get(picks[0], picks[0]) if picks else "",
+                'Holdings_Full': ", ".join([TICKER_INFO.get(x,x) for x in picks])
+            })
+            
+    return pd.DataFrame(logs)
+
+# ==============================================================================
 # [메인 컨트롤러]
 # ==============================================================================
-st.title("🌍 Alpha Seeking Pro (Final Debug)")
+st.title("🌍 Alpha Seeking Pro (Final)")
 
 # --- 1. 사이드바 ---
 with st.sidebar:
     st.header("🏳️ 시장 선택")
     market = st.radio("국가 선택", ["🇰🇷 한국 (Korea)", "🇺🇸 미국 (USA)"], horizontal=True)
     
-    # [수정] 변수 초기화 (오류 방지)
     us_index = "S&P 500" 
     
     if "한국" in market:
@@ -212,6 +327,10 @@ with st.sidebar:
         us_index = st.selectbox("지수 선택", ["S&P 500", "NASDAQ 100", "DOW 30"])
         with st.spinner("데이터 수집 중..."):
             TICKER_INFO, ALL_STOCKS = load_us_data(us_index)
+            
+    # 전역 변수 업데이트 (함수 내부에서 쓰기 위해)
+    CONST['MIN_AMT'] = MIN_AMT
+    CONST['COST_RATE'] = COST_RATE
 
     st.divider()
     st.header("⚙️ 전략 설정")
@@ -330,57 +449,27 @@ else:
             else: p, v, bm = fetch_data_us(u)
                 
             if not p.empty:
-                reb_dates = p.resample('M').last().index
-                logs = []
+                # 실행된 백테스트 결과 DataFrame
+                res = run_backtest(p, v, bm, weights, TICKER_INFO)
                 
-                for i in range(12, len(reb_dates)-1):
-                    curr, next_d = reb_dates[i], reb_dates[i+1]
+                if not res.empty:
+                    res = res.set_index('Date')
                     
-                    # [수정] 벤치마크 수익률 계산 (안정적 방식: asof)
-                    # 해당 날짜의 벤치마크 가격이 없으면 가장 가까운 과거값 사용
-                    try:
-                        bm_start = bm.asof(curr)
-                        bm_end = bm.asof(next_d)
-                        if pd.isna(bm_start) or pd.isna(bm_end): bm_ret = 0.0
-                        else: bm_ret = (bm_end / bm_start) - 1
-                    except: bm_ret = 0.0
-
-                    p_sub = p.loc[:curr].tail(300)
-                    v_sub = v.loc[:curr].tail(300)
+                    # 1. 포트폴리오 누적
+                    res['Cum_Port'] = (1 + res['Port_Ret']).cumprod()
                     
-                    daily = []
-                    active = p_sub.columns[p_sub.iloc[-1].notna()]
-                    
-                    for t in active:
-                        f = calculate_factors(p_sub[t], v_sub[t], MIN_AMT)
-                        if f: 
-                            f['code'] = t; daily.append(f)
-                    
-                    if not daily: continue
-                    
-                    ranked = rank_and_score(pd.DataFrame(daily).set_index('code'), weights)
-                    picks = ranked.head(20).index.tolist()
-                    
-                    ret_wd = p.loc[curr:next_d, picks].pct_change().dropna()
-                    if ret_wd.empty: continue
-                    
-                    port_ret = (1+ret_wd).prod().mean() - 1 - COST_RATE
-                    
-                    logs.append({
-                        'Date': next_d, 'Port_Ret': port_ret, 'BM_Ret': bm_ret,
-                        'Holdings': ", ".join([TICKER_INFO.get(x,x) for x in picks])
-                    })
-                
-                if logs:
-                    res = pd.DataFrame(logs).set_index('Date')
-                    # 누적 수익률 계산
-                    res['Cum_Port'] = (1+res['Port_Ret']).cumprod()
-                    res['Cum_BM'] = (1+res['BM_Ret']).cumprod()
+                    # [수정] 벤치마크 Rebase (그래프 끊김 방지)
+                    if not bm.empty:
+                        bm_period = bm.loc[res.index[0]:res.index[-1]]
+                        if not bm_period.empty:
+                            res['Cum_BM'] = bm_period / bm_period.iloc[0]
+                            res['Cum_BM'] = res['Cum_BM'].reindex(res.index, method='ffill')
+                        else: res['Cum_BM'] = 1.0
+                    else: res['Cum_BM'] = 1.0
                     
                     # --- Chart ---
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(x=res.index, y=res['Cum_Port'], name="My Strategy", line=dict(color='#3b82f6', width=2)))
-                    # [수정] 벤치마크 그래프 표시 보장
                     fig.add_trace(go.Scatter(x=res.index, y=res['Cum_BM'], name=BM_NAME, line=dict(color='#94a3b8', dash='dot')))
                     st.plotly_chart(fig, use_container_width=True)
                     
@@ -402,6 +491,6 @@ else:
                     k5.metric("Win Rate", f"{win:.1%}")
                     
                     st.divider()
-                    st.dataframe(res[['Port_Ret', 'Holdings']].tail(5), use_container_width=True)
+                    st.dataframe(res[['Port_Ret', 'Holdings_Full', 'BM_Ret']].tail(5), use_container_width=True)
                 else: st.error("백테스트 결과가 없습니다.")
             else: st.error("데이터 로딩 실패")
