@@ -34,9 +34,9 @@ CONST = {
     'VOL_WINDOW': 252,         
     'COST_RATE': 0.002,        
     'TOP_N': 20,               
-    'BACKTEST_YEARS': 3,       
+    'BACKTEST_YEARS': 10,      # [수정] 다시 10년으로 복구
     'WARMUP_DAYS': 300,
-    'MIN_AMT': 5_000_000_000  # 최소 거래대금 50억
+    'MIN_AMT': 5_000_000_000   # 최소 거래대금 50억
 }
 
 # [테마 매핑]
@@ -153,7 +153,7 @@ def get_vix_enhanced():
 # [Backtest Engine]
 # ==============================================================================
 @st.cache_data(ttl=3600*24)
-def fetch_data_batch(universe, days=365*3):
+def fetch_data_batch(universe, days=365*10): # [수정] 10년치 확보
     start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
     kospi = fdr.DataReader('KS11', start_date)['Close']
     
@@ -332,7 +332,7 @@ else:
     st.info("⚡ 속도 최적화 적용: 유동성 상위 400개 종목 샘플링 & 병렬 처리")
     
     if st.button("백테스트 시작", type="primary"):
-        with st.spinner("과거 데이터 시뮬레이션 중..."):
+        with st.spinner("과거 10년 데이터 로딩 및 시뮬레이션 중... (최대 1~2분 소요)"):
             universe = ALL_STOCKS_LIST[:400]
             p_df, v_df, bm = fetch_data_batch(universe, days=365 * CONST['BACKTEST_YEARS'])
             
@@ -360,37 +360,24 @@ else:
                     
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    # ==========================================================
-                    # [성과 지표 상세 분석 (Metrics Enhanced)]
-                    # ==========================================================
-                    
-                    # 1. 데이터 준비
+                    # 성과 지표 (Metrics)
                     port_rets = res['Port_Ret']
                     cum_ret = res['Cum_Port'].iloc[-1]
                     total_ret = cum_ret - 1
                     months = len(port_rets)
                     years = months / 12
                     
-                    # 2. 핵심 지표 계산
-                    # (1) CAGR (기하 평균)
                     cagr = (cum_ret) ** (1 / years) - 1 if years > 0 else 0
-                    
-                    # (2) Volatility (연 변동성)
                     ann_vol = port_rets.std() * np.sqrt(12)
-                    
-                    # (3) Sharpe Ratio (무위험 수익률 0 가정)
                     sharpe = cagr / ann_vol if ann_vol != 0 else 0
                     
-                    # (4) MDD (Expanding Max)
                     running_max = res['Cum_Port'].cummax()
                     drawdown = (res['Cum_Port'] / running_max) - 1
                     max_dd = drawdown.min()
                     
-                    # (5) Win Rate (승률)
                     win_months = (port_rets > 0).sum()
                     win_rate = win_months / months if months > 0 else 0
                     
-                    # 3. UI 출력
                     st.divider()
                     st.subheader("📊 전략 성과 정밀 분석")
                     
@@ -400,8 +387,6 @@ else:
                     k3.metric("최대 낙폭 (MDD)", f"{max_dd:.1%}", help="최악의 경우 겪을 수 있는 하락폭입니다. 낮을수록 좋습니다.")
                     k4.metric("샤프 지수 (위험대비)", f"{sharpe:.2f}", help="1.0 이상이면 양호, 2.0 이상이면 매우 훌륭한 전략입니다.")
                     k5.metric("월간 승률 (Win Rate)", f"{win_rate:.1%}", f"{win_months}/{months}개월", help="전체 기간 중 수익을 낸 달의 비율입니다.")
-                    
-                    # ==========================================================
                     
                     st.divider()
                     st.caption("📜 월별 상세 운용 기록")
