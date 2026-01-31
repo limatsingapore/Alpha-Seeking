@@ -1,6 +1,6 @@
-streamlit
+lxml
 yfinance
-pandas
-numpy
-plotly
 finance-datareader
+plotly
+streamlit
+requests
