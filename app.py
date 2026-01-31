@@ -12,7 +12,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Ultimate)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -34,19 +34,9 @@ CONST = {
     'VOL_WINDOW': 252,         
     'COST_RATE': 0.002,        
     'TOP_N': 20,               
-    'BACKTEST_YEARS': 10,      # [수정] 다시 10년으로 복구
+    'BACKTEST_YEARS': 10,      
     'WARMUP_DAYS': 300,
     'MIN_AMT': 5_000_000_000   # 최소 거래대금 50억
-}
-
-# [테마 매핑]
-THEME_MAP = {
-    "🤖 AI/반도체": ["000660", "058470", "005930", "042700", "036540", "357780"],
-    "🚀 방산/우주": ["012450", "064350", "005950", "079550", "047810"],
-    "💊 바이오/헬스": ["207940", "068270", "214370", "290650", "145020"],
-    "🔋 2차전지": ["006400", "003670", "247540", "051910"],
-    "🚗 모빌리티": ["005380", "000270", "012330", "003620"],
-    "🏦 밸류업(금융/지주)": ["003550", "055550", "105560", "086790", "000810"]
 }
 
 # ==============================================================================
@@ -116,26 +106,20 @@ def load_market_data():
         df_krx = df_krx[~df_krx['Name'].str.contains('스팩|우B|우|리츠|홀딩스', na=False)]
         
         if 'Amount' in df_krx.columns:
+            # 유동성 상위 500개만 유니버스로 사용
             df_krx = df_krx.sort_values('Amount', ascending=False).head(500)
             
         ticker_info = df_krx.set_index('Code')['Name'].to_dict()
-        
-        ticker_theme = {}
-        for code in df_krx['Code']:
-            my_themes = []
-            for theme, codes in THEME_MAP.items():
-                if code in codes: my_themes.append(theme)
-            ticker_theme[code] = ", ".join(my_themes) if my_themes else "기타"
-
         all_tickers = df_krx['Code'].tolist()
-        return THEME_MAP, ticker_info, all_tickers, ticker_theme
+        
+        return ticker_info, all_tickers
 
     except Exception as e:
         st.error(f"데이터 로딩 실패: {e}")
-        return {}, {}, [], {}
+        return {}, []
 
 with st.spinner("KRX 데이터 최적화 로딩 중..."):
-    THEMES, TICKER_INFO, ALL_STOCKS_LIST, TICKER_THEME = load_market_data()
+    TICKER_INFO, ALL_STOCKS_LIST = load_market_data()
 
 @st.cache_data(ttl=600)
 def get_vix_enhanced():
@@ -153,7 +137,7 @@ def get_vix_enhanced():
 # [Backtest Engine]
 # ==============================================================================
 @st.cache_data(ttl=3600*24)
-def fetch_data_batch(universe, days=365*10): # [수정] 10년치 확보
+def fetch_data_batch(universe, days=365*10): 
     start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
     kospi = fdr.DataReader('KS11', start_date)['Close']
     
@@ -228,28 +212,52 @@ def run_backtest(prices, volumes, benchmark, weights, ticker_map):
 # ==============================================================================
 # [UI 구성]
 # ==============================================================================
-st.title("🧬 Alpha Seeking Pro (Ultimate)")
+st.title("🧬 Alpha Seeking Pro (Final)")
 
 with st.sidebar:
     st.header("⚙️ 전략 설정")
     
-    with st.expander("📚 전략 프리셋 가이드", expanded=False):
+    # 10가지 프리셋 정의 (가중치: Mom, Liq, Vol, Risk)
+    PRESETS = {
+        "사용자 정의": (0.5, 0.5, 0.5, 0.5),
+        "🔥 야수의 심장 (공격 몰빵)": (1.0, 1.0, 0.0, 0.0),
+        "🚀 달리는 말 (추세 추종)": (1.0, 0.5, 0.2, 0.3),
+        "🌊 세력주 포착 (수급 집중)": (0.4, 1.0, 0.2, 0.2),
+        "🏰 철벽 방어 (극강 수비)": (0.1, 0.1, 1.0, 1.0),
+        "🧘 마음의 평화 (저변동성)": (0.3, 0.2, 1.0, 0.5),
+        "🚑 좀비 헌터 (낙폭과대)": (0.4, 0.3, 0.3, 1.0),
+        "⚖️ 황금 밸런스 (중립)": (0.5, 0.5, 0.5, 0.5),
+        "💎 우상향 정석 (성장+안정)": (0.7, 0.3, 0.7, 0.4),
+        "🐆 안전한 사냥 (공격8:수비2)": (0.8, 0.7, 0.1, 0.8),
+        "🧠 스마트 머니 (수급+방어)": (0.5, 0.8, 0.3, 0.8)
+    }
+    
+    with st.expander("📚 전략 프리셋 가이드 (10선)", expanded=False):
         st.markdown("""
-        **1. 🔥 야수의 심장** (추세 1.0 / 수급 1.0)
-        **2. 🐆 안전한 사냥** (추세 0.8 / 수급 0.7 / 방어 0.8) - *추천*
-        **3. 🛡️ 철벽 방어** (저변동 1.0 / 방어 1.0)
+        ### ⚔️ 공격형
+        1. **🔥 야수의 심장**: 리스크 무시, 오직 수익률과 거래량만 본다.
+        2. **🚀 달리는 말**: 전형적인 추세 추종. 가는 놈이 더 간다.
+        3. **🌊 세력주 포착**: 가격은 아직이나 돈(거래량)이 수상하게 몰리는 종목.
+
+        ### 🛡️ 수비형
+        4. **🏰 철벽 방어**: 하락장에서 내 돈을 지키는 것이 목표.
+        5. **🧘 마음의 평화**: 밤에 발 뻗고 잘 수 있는 얌전한 주식.
+        6. **🚑 좀비 헌터**: 바닥이 단단하여 더 떨어질 곳이 없는 종목.
+
+        ### ⚖️ 균형형
+        7. **⚖️ 황금 밸런스**: 모든 지표를 골고루 섞은 모범생.
+        8. **💎 우상향 정석**: 적당한 상승 추세와 낮은 변동성의 조화.
+        9. **🐆 안전한 사냥 (추천)**: 공격적으로 수익을 내되 안전벨트는 착용.
+        10. **🧠 스마트 머니**: 메이저 수급이 들어와 가격 관리가 되는 종목.
         """)
     
-    preset = st.selectbox("프리셋 선택", ["사용자 정의", "🐆 안전한 사냥 (추천)", "🔥 야수의 심장", "🛡️ 철벽 방어"])
-    if preset == "🐆 안전한 사냥 (추천)": def_w = (0.8, 0.7, 0.1, 0.8)
-    elif preset == "🔥 야수의 심장": def_w = (1.0, 1.0, 0.0, 0.0)
-    elif preset == "🛡️ 철벽 방어": def_w = (0.1, 0.1, 1.0, 1.0)
-    else: def_w = (0.4, 0.2, 0.2, 0.2)
+    selected_preset = st.selectbox("전략 프리셋 선택", list(PRESETS.keys()), index=9) # 기본값: 안전한 사냥
+    def_w = PRESETS[selected_preset]
 
-    w_mom = st.slider("📈 추세", 0.0, 1.0, def_w[0], 0.1)
-    w_liq = st.slider("🌊 수급", 0.0, 1.0, def_w[1], 0.1)
-    w_vol = st.slider("⚖️ 저변동성", 0.0, 1.0, def_w[2], 0.1)
-    w_risk = st.slider("🛡️ 방어력", 0.0, 1.0, def_w[3], 0.1)
+    w_mom = st.slider("📈 추세 (Momentum)", 0.0, 1.0, def_w[0], 0.1)
+    w_liq = st.slider("🌊 수급 (Liquidity)", 0.0, 1.0, def_w[1], 0.1)
+    w_vol = st.slider("⚖️ 저변동성 (Low Vol)", 0.0, 1.0, def_w[2], 0.1)
+    w_risk = st.slider("🛡️ 방어력 (MDD)", 0.0, 1.0, def_w[3], 0.1)
     weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
     
     st.divider()
@@ -259,19 +267,15 @@ with st.sidebar:
 # TAB 1: 실시간
 # ------------------------------------------------------------------------------
 if mode == "📊 실시간 스크리닝":
-    st.subheader("실시간 팩터 랭킹")
+    st.subheader("실시간 팩터 랭킹 (Top 500 Universe)")
+    st.info("💡 테마별 보기를 제거하고, **전체 유니버스(유동성 상위 500개)**를 대상으로 통합 분석합니다.")
     
-    filter_opt = st.radio("필터 기준", ["전체 유니버스 (Top 500)", "테마별 보기"], horizontal=True)
-    target_list = []
-    if filter_opt == "테마별 보기":
-        thm = st.selectbox("테마 선택", list(THEMES.keys()))
-        target_list = THEMES[thm]
-    else:
+    if st.button("전체 종목 분석 실행", type="primary"):
+        # 전체 유니버스 대상 (속도 최적화를 위해 이미 500개로 필터링됨)
         target_list = ALL_STOCKS_LIST
-    
-    if st.button("분석 실행", type="primary"):
+        
         results = []
-        bar = st.progress(0, "데이터 분석 중...")
+        bar = st.progress(0, "전체 시장 데이터 스캔 중...")
         
         def get_snapshot(t):
             try:
@@ -329,7 +333,6 @@ if mode == "📊 실시간 스크리닝":
 # ------------------------------------------------------------------------------
 else:
     st.subheader(f"📉 Walk-Forward Backtest ({CONST['BACKTEST_YEARS']} Years)")
-    st.info("⚡ 속도 최적화 적용: 유동성 상위 400개 종목 샘플링 & 병렬 처리")
     
     if st.button("백테스트 시작", type="primary"):
         with st.spinner("과거 10년 데이터 로딩 및 시뮬레이션 중... (최대 1~2분 소요)"):
