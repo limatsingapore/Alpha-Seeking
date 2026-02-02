@@ -42,7 +42,7 @@ CONST = {
 }
 
 # ==============================================================================
-# [Helper: 날짜 및 데이터]
+# [Helper: 날짜 계산]
 # ==============================================================================
 def get_last_complete_month_end():
     today = datetime.now()
@@ -50,6 +50,9 @@ def get_last_complete_month_end():
     last_month_end = first_of_this_month - timedelta(days=1)
     return last_month_end
 
+# ==============================================================================
+# [데이터 로더]
+# ==============================================================================
 @st.cache_data(ttl=3600*12)
 def load_kr_data():
     try:
@@ -58,9 +61,8 @@ def load_kr_data():
         if 'Symbol' in df.columns: df.rename(columns={'Symbol':'Code'}, inplace=True)
         df = df[~df['Name'].str.contains('스팩|우B|우|리츠|홀딩스', na=False)]
         if 'Amount' in df.columns:
-            df = df.sort_values('Amount', ascending=False).head(600) # 분석 대상 확대
+            df = df.sort_values('Amount', ascending=False).head(600) # 유니버스 확대
         
-        # 섹터 정보 확보
         if 'Sector' not in df.columns: df['Sector'] = '기타'
         
         return df.set_index('Code')['Name'].to_dict(), df['Code'].tolist(), df.set_index('Code')['Sector'].to_dict()
@@ -91,7 +93,6 @@ def load_us_data(index_name='S&P 500'):
         rename_map = {'Symbol': 'Code', 'Ticker': 'Code', 'Security': 'Name', 'Company': 'Name', 'GICS Sector': 'Sector'}
         df = df.rename(columns=rename_map)
         
-        # Sector 컬럼 확인
         if 'Sector' not in df.columns: df['Sector'] = 'Unknown'
 
         df = df[['Code', 'Name', 'Sector']].dropna()
@@ -102,7 +103,7 @@ def load_us_data(index_name='S&P 500'):
         return {"AAPL":"Apple"}, ["AAPL"], {}
 
 # ==============================================================================
-# [Core Logic: 월간 퀀트 & 단타 스캐너]
+# [Core Logic: 팩터 계산]
 # ==============================================================================
 def calculate_factors(price, volume, min_amt, trading_days=252):
     """중장기 퀀트 팩터"""
@@ -133,21 +134,15 @@ def calculate_short_term_factors(price, volume):
     if len(price) < 20: return None
     
     try:
-        # 1. 단기 모멘텀
         mom_1d = price.pct_change(1).iloc[-1]
         mom_3d = price.pct_change(3).iloc[-1]
         mom_5d = price.pct_change(5).iloc[-1]
         
-        # 2. 거래량 급증 (Volume Spike)
         vol_ma_20 = volume.iloc[-21:-1].mean()
         if vol_ma_20 == 0: return None
         vol_spike = volume.iloc[-1] / vol_ma_20
         
-        # 3. 변동성 (Intraday Volatility Proxy)
-        # 고가/저가 데이터가 없으므로 종가 기준 표준편차로 대체
         recent_vol = price.tail(5).std() / price.tail(5).mean()
-        
-        # 4. 이격도 (Disparity)
         ma_20 = price.tail(20).mean()
         disparity = (price.iloc[-1] / ma_20) * 100
         
@@ -288,7 +283,63 @@ def run_backtest(prices, volumes, benchmark, weights, ticker_map):
     return pd.DataFrame(logs)
 
 # ==============================================================================
-# [UI 및 메인 실행]
+# [전략 최적화 엔진]
+# ==============================================================================
+def optimize_strategy(prices, volumes, benchmark, ticker_map, presets={}):
+    results = []
+    if prices.empty or volumes.empty: return pd.DataFrame()
+
+    progress_bar = st.progress(0, text="전략 시뮬레이션 시작...")
+    total_presets = len(presets)
+    
+    for i, (name, (mom, liq, vol, risk)) in enumerate(presets.items()):
+        weights = {'mom': mom, 'liq': liq, 'vol': vol, 'risk': risk}
+        try:
+            res = run_backtest(prices, volumes, benchmark, weights, ticker_map)
+            if not res.empty:
+                res = res.set_index('Date')
+                res['Cum_Port'] = (1 + res['Port_Ret']).cumprod()
+                
+                tot = res['Cum_Port'].iloc[-1] - 1
+                y = len(res)/12
+                if y <= 0: y = 1
+                cagr = (tot+1)**(1/y)-1
+                mdd = (res['Cum_Port']/res['Cum_Port'].cummax()-1).min()
+                ann_vol = res['Port_Ret'].std() * np.sqrt(12)
+                sharpe = cagr / ann_vol if ann_vol != 0 else 0
+                win_rate = (res['Port_Ret']>0).sum()/len(res)
+                
+                results.append({
+                    '전략명': name, '승률': win_rate, '연수익률(CAGR)': cagr,
+                    '누적수익률': tot, 'MDD': mdd, '샤프비율': sharpe, '변동성': ann_vol,
+                    '가중치': f"추세{mom}|수급{liq}|저변동{vol}|방어{risk}"
+                })
+        except: pass
+        progress_bar.progress((i + 1) / total_presets, text=f"분석 중: {name}")
+    
+    progress_bar.empty()
+    if not results: return pd.DataFrame()
+    return pd.DataFrame(results).sort_values(by='연수익률(CAGR)', ascending=False)
+
+def highlight_top3(s):
+    is_volatility = s.name == '변동성'
+    if is_volatility: sorted_vals = s.sort_values(ascending=True).unique()
+    else: sorted_vals = s.sort_values(ascending=False).unique()
+    
+    top1 = sorted_vals[0] if len(sorted_vals) > 0 else None
+    top2 = sorted_vals[1] if len(sorted_vals) > 1 else None
+    top3 = sorted_vals[2] if len(sorted_vals) > 2 else None
+    
+    styles = []
+    for v in s:
+        if v == top1: styles.append('background-color: #FFD700; color: black; font-weight: bold')
+        elif v == top2: styles.append('color: #FF4B4B; font-weight: bold')
+        elif v == top3: styles.append('font-weight: bold')
+        else: styles.append('')
+    return styles
+
+# ==============================================================================
+# [메인 컨트롤러]
 # ==============================================================================
 st.title("🌍 Alpha Seeking Pro (Ultimate)")
 
@@ -325,20 +376,17 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    
-    # [NEW] 확장된 모드 선택
     mode = st.radio("모드 선택", [
         "📊 실시간 퀀트 분석", 
         "⚡ 단타/스윙 스캐너", 
         "🔄 섹터 히트맵",
         "🎰 포트폴리오 진단",
-        "📉 과거 백테스트"
+        "📉 과거 백테스트",
+        "🔍 전략 전체 비교 (최적화)"
     ])
 
     st.divider()
-    
-    # 전략 설정 (공통 사용)
-    st.header("⚙️ 퀀트 전략 설정")
+    st.header("⚙️ 전략 설정")
     PRESETS = {
         "사용자 정의": (0.5, 0.5, 0.5, 0.5),
         "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
@@ -348,6 +396,9 @@ with st.sidebar:
         "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8),
         "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1),
         "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9),
+        "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6),
+        "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2),
+        "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7)
     }
     sel_preset = st.selectbox("프리셋", list(PRESETS.keys()), index=5)
     dw = PRESETS[sel_preset]
@@ -360,19 +411,19 @@ with st.sidebar:
 # --- VIX Helper ---
 def get_vix_val(ticker):
     try:
-        if ticker == "KS200VIX":
-            df = fdr.DataReader(ticker, (datetime.now()-timedelta(days=60)))
-        else:
-            df = yf.Ticker(ticker).history(period="3mo")
+        if ticker == "KS200VIX": df = fdr.DataReader(ticker, (datetime.now()-timedelta(days=60)))
+        else: df = yf.Ticker(ticker).history(period="3mo")
         if df.empty: return None, 0
         return df['Close'].iloc[-1], df['Close'].iloc[-1] - df['Close'].iloc[-2]
     except: return None, 0
 
 # ==============================================================================
-# [MODE 1] 실시간 퀀트 분석 (기존)
+# [APP 실행 로직]
 # ==============================================================================
+
+# 1. 실시간 분석
 if mode == "📊 실시간 퀀트 분석":
-    st.subheader(f"📊 {market} 월간 퀀트 랭킹")
+    st.subheader(f"📊 {market} 실시간 랭킹")
     if st.button("분석 실행", type="primary"):
         targets = ALL_STOCKS
         results = []
@@ -398,11 +449,8 @@ if mode == "📊 실시간 퀀트 분석":
         
         if results:
             final = rank_and_score(pd.DataFrame(results).set_index('code'), weights)
-            
-            # Add Sector Info
             final['Sector'] = [SECTOR_INFO.get(x, 'Unknown') for x in final.index]
             
-            # Dashboard
             vix, v_delta = get_vix_val(VIX_TICKER)
             c1, c2, c3 = st.columns([1,1,2])
             top = final.iloc[0]
@@ -412,19 +460,23 @@ if mode == "📊 실시간 퀀트 분석":
                 state = "🔴 공포" if vix >= (22 if COUNTRY=="KR" else 30) else "🟢 안정"
                 c3.metric(f"VIX ({state})", f"{vix:.2f}", f"{v_delta:+.2f}", delta_color="inverse")
                 
-            st.dataframe(final[['Total_Score', 'price', 'mom_short', 'mdd', 'Sector']].rename(index=TICKER_INFO), use_container_width=True)
+            st.dataframe(
+                final[['Total_Score', 'price', 'mom_short', 'mdd', 'Sector']].rename(index=TICKER_INFO),
+                use_container_width=True,
+                column_config={
+                    "Total_Score": st.column_config.ProgressColumn("점수", min_value=0, max_value=100),
+                    "price": st.column_config.NumberColumn("현재가", format=f"{CURRENCY}%.2f"),
+                    "mom_short": st.column_config.NumberColumn("단기추세", format="%.2%"),
+                    "mdd": st.column_config.NumberColumn("MDD", format="%.2%")
+                }
+            )
         else: st.warning("결과 없음")
 
-# ==============================================================================
-# [MODE 2] 단타/스윙 스캐너 (NEW)
-# ==============================================================================
+# 2. 단타/스윙 스캐너
 elif mode == "⚡ 단타/스윙 스캐너":
     st.subheader("⚡ 오늘/내일 단기 급등 유망주")
-    st.caption("조건: 거래량 급증(Volume Spike) + 단기 추세 살아있음 + 이격도 적정")
-    
     col1, col2 = st.columns(2)
-    with col1:
-        scan_type = st.selectbox("스캔 타입", ["🚀 급등 출발 (거래량 터짐)", "🎣 눌림목 (3일 하락 후 반등)"])
+    with col1: scan_type = st.selectbox("스캔 타입", ["🚀 급등 출발 (거래량 터짐)", "🎣 눌림목 (3일 하락 후 반등)"])
     
     if st.button("스캔 시작", type="primary"):
         targets = ALL_STOCKS
@@ -433,10 +485,8 @@ elif mode == "⚡ 단타/스윙 스캐너":
         
         def short_worker(t):
             try:
-                # 단타는 최근 60일치만 있으면 됨
                 if COUNTRY == "KR": df = fdr.DataReader(t, (datetime.now()-timedelta(days=100)).strftime('%Y-%m-%d'))
                 else: df = yf.Ticker(t).history(period="3mo")
-                
                 if len(df) < 20: return None
                 f = calculate_short_term_factors(df['Close'], df['Volume'])
                 if f: f['code'] = t
@@ -455,21 +505,10 @@ elif mode == "⚡ 단타/스윙 스캐너":
             df_short = pd.DataFrame(short_results).set_index('code')
             df_short['Name'] = [TICKER_INFO.get(x,x) for x in df_short.index]
             
-            # 필터링 로직
             if "급등 출발" in scan_type:
-                # 거래량 2배 이상 + 1일 수익률 양수 + 5일 수익률 5% 이상
-                picks = df_short[
-                    (df_short['vol_spike'] >= 2.0) & 
-                    (df_short['mom_1d'] > 0) & 
-                    (df_short['mom_5d'] > 0.05)
-                ].sort_values('vol_spike', ascending=False)
-            else: # 눌림목
-                # 3일 수익률 음수 + 5일 추세는 상승 + 거래량은 감소 중
-                picks = df_short[
-                    (df_short['mom_3d'] < -0.02) & 
-                    (df_short['mom_5d'] > 0.05) & 
-                    (df_short['vol_spike'] < 1.0)
-                ].sort_values('mom_5d', ascending=False)
+                picks = df_short[(df_short['vol_spike'] >= 2.0) & (df_short['mom_1d'] > 0) & (df_short['mom_5d'] > 0.05)].sort_values('vol_spike', ascending=False)
+            else: 
+                picks = df_short[(df_short['mom_3d'] < -0.02) & (df_short['mom_5d'] > 0.05) & (df_short['vol_spike'] < 1.0)].sort_values('mom_5d', ascending=False)
             
             st.success(f"검출된 종목: {len(picks)}개")
             st.dataframe(
@@ -483,48 +522,29 @@ elif mode == "⚡ 단타/스윙 스캐너":
             )
         else: st.warning("데이터가 없습니다.")
 
-# ==============================================================================
-# [MODE 3] 섹터 히트맵 (NEW)
-# ==============================================================================
+# 3. 섹터 히트맵
 elif mode == "🔄 섹터 히트맵":
     st.subheader("🔄 실시간 섹터 자금 흐름")
-    
-    if not SECTOR_INFO:
-        st.error("섹터 정보가 없습니다.")
+    if not SECTOR_INFO: st.error("섹터 정보가 없습니다.")
     else:
-        # 섹터별 종목 카운트
         sector_counts = pd.Series(SECTOR_INFO.values()).value_counts()
-        
-        # 트리맵 시각화
-        fig = px.treemap(
-            names=sector_counts.index,
-            parents=["Market"] * len(sector_counts),
-            values=sector_counts.values,
-            title=f"{market} 섹터 비중 (종목 수 기준)"
-        )
+        fig = px.treemap(names=sector_counts.index, parents=["Market"]*len(sector_counts), values=sector_counts.values, title=f"{market} 섹터 비중")
         st.plotly_chart(fig, use_container_width=True)
-        
-        st.info("💡 팁: '실시간 퀀트 분석'을 먼저 실행한 후 결과를 보면, 어떤 섹터가 상위권에 많은지 알 수 있습니다.")
 
-# ==============================================================================
-# [MODE 4] 포트폴리오 진단 (NEW)
-# ==============================================================================
+# 4. 포트폴리오 진단
 elif mode == "🎰 포트폴리오 진단":
     st.subheader("🎰 내 보유 종목 점수 매기기")
-    
     user_input = st.text_area("종목코드 입력 (쉼표로 구분)", "005930, 000660" if COUNTRY=="KR" else "AAPL, NVDA, TSLA")
     
     if st.button("진단 실행"):
         codes = [c.strip() for c in user_input.split(',')]
         results = []
-        
         for t in codes:
             try:
                 if COUNTRY == "KR": df = fdr.DataReader(t, (datetime.now()-timedelta(days=300)).strftime('%Y-%m-%d'))
                 else: df = yf.Ticker(t).history(period="1y")
-                
                 if not df.empty:
-                    f = calculate_factors(df['Close'], df['Volume'], 0) # 내 종목은 거래대금 필터 끔
+                    f = calculate_factors(df['Close'], df['Volume'], 0)
                     if f: 
                         f['code'] = t
                         results.append(f)
@@ -534,21 +554,13 @@ elif mode == "🎰 포트폴리오 진단":
             df_pf = pd.DataFrame(results).set_index('code')
             scored = rank_and_score(df_pf, weights)
             scored['Name'] = [TICKER_INFO.get(x,x) for x in scored.index]
-            
             avg_score = scored['Total_Score'].mean()
             st.metric("내 포트폴리오 평균 점수", f"{avg_score:.1f}점", help="80점 이상이면 매우 우수")
-            
-            st.dataframe(
-                scored[['Name', 'Total_Score', 'mom_short', 'mdd']],
-                use_container_width=True,
-                column_config={"Total_Score": st.column_config.ProgressColumn("점수", min_value=0, max_value=100)}
-            )
+            st.dataframe(scored[['Name', 'Total_Score', 'mom_short', 'mdd']], use_container_width=True, column_config={"Total_Score": st.column_config.ProgressColumn("점수", min_value=0, max_value=100)})
         else: st.error("유효한 종목이 없습니다.")
 
-# ==============================================================================
-# [MODE 5] 과거 백테스트 (기존)
-# ==============================================================================
-else:
+# 5. 백테스트
+elif mode == "📉 과거 백테스트":
     c1, c2 = st.columns(2)
     with c1: start_date = st.date_input("시작일", CONST['DEFAULT_START_DATE'])
     with c2: end_date = st.date_input("종료일", get_last_complete_month_end())
@@ -574,17 +586,70 @@ else:
                     fig.add_trace(go.Scatter(x=res.index, y=res['Cum_BM'], name=BM_NAME, line=dict(dash='dot')))
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    # Metrics
                     tot = res['Cum_Port'].iloc[-1] - 1
                     y = len(res)/12
-                    cagr = (tot+1)**(1/y)-1 if y>0 else 0
+                    if y<=0: y=1
+                    cagr = (tot+1)**(1/y)-1
                     mdd = (res['Cum_Port']/res['Cum_Port'].cummax()-1).min()
                     
                     c1, c2, c3 = st.columns(3)
                     c1.metric("CAGR", f"{cagr:.1%}")
                     c2.metric("Total Return", f"{tot:.1%}")
                     c3.metric("MDD", f"{mdd:.1%}")
-                    
                     st.dataframe(res[['Port_Ret', 'Holdings_Full']].tail(), use_container_width=True)
                 else: st.error("결과 없음")
             else: st.error("데이터 로딩 실패")
+
+# 6. 전략 최적화 (NEW)
+else:
+    st.subheader("🔍 전체 전략 성과 비교")
+    c1, c2 = st.columns(2)
+    with c1: start_date = st.date_input("시작일", CONST['DEFAULT_START_DATE'], key='opt_start')
+    with c2: end_date = st.date_input("종료일", get_last_complete_month_end(), key='opt_end')
+    
+    if st.button("🚀 전체 전략 분석 실행", type="primary"):
+        if start_date >= end_date: st.error("기간 설정 오류")
+        else:
+            with st.spinner("모든 전략 시뮬레이션 중..."):
+                u = ALL_STOCKS[:400] if len(ALL_STOCKS) > 400 else ALL_STOCKS
+                if COUNTRY == "KR": p, v, bm = fetch_data_kr(u, start_date, end_date)
+                else: p, v, bm = fetch_data_us(u, start_date, end_date)
+                
+                if not p.empty:
+                    test_presets = {k:v for k,v in PRESETS.items() if k != "사용자 정의"}
+                    df_result = optimize_strategy(p, v, bm, TICKER_INFO, test_presets)
+                    
+                    if not df_result.empty:
+                        st.success("분석 완료!")
+                        st.dataframe(df_result.style.apply(highlight_top3, subset=['승률', '연수익률(CAGR)', '누적수익률', 'MDD', '샤프비율', '변동성'])
+                            .format({'승률':'{:.1%}','연수익률(CAGR)':'{:.1%}','누적수익률':'{:.1%}','MDD':'{:.1%}','샤프비율':'{:.2f}','변동성':'{:.1%}'}), 
+                            use_container_width=True, height=500)
+                        
+                        best_st = df_result.iloc[0]
+                        st.divider()
+                        st.subheader(f"👑 1위 전략: {best_st['전략명']}")
+                        
+                        ws_str = best_st['가중치']
+                        parts = ws_str.split('|')
+                        w_dict = {}
+                        for part in parts:
+                            if '추세' in part: w_dict['mom'] = float(part.replace('추세', ''))
+                            elif '수급' in part: w_dict['liq'] = float(part.replace('수급', ''))
+                            elif '저변동' in part: w_dict['vol'] = float(part.replace('저변동', ''))
+                            elif '방어' in part: w_dict['risk'] = float(part.replace('방어', ''))
+                        
+                        res = run_backtest(p, v, bm, w_dict, TICKER_INFO)
+                        if not res.empty:
+                            res = res.set_index('Date')
+                            res['Cum_Port'] = (1 + res['Port_Ret']).cumprod()
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(x=res.index, y=res['Cum_Port'], name=best_st['전략명'], line=dict(color='#FFD700', width=2)))
+                            if not bm.empty:
+                                try:
+                                    bm_p = bm.loc[start_date:end_date]
+                                    bm_re = bm_p / bm_p.iloc[0]
+                                    fig.add_trace(go.Scatter(x=bm_re.index, y=bm_re.values, name=BM_NAME, line=dict(dash='dot', color='gray')))
+                                except: pass
+                            st.plotly_chart(fig, use_container_width=True)
+                    else: st.error("분석 결과 없음")
+                else: st.error("데이터 로딩 실패")
