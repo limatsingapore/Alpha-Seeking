@@ -8,12 +8,13 @@ import logging
 import FinanceDataReader as fdr
 import yfinance as yf
 import requests
+import time
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (The Real)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final Stable)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -40,7 +41,7 @@ CONST = {
 }
 
 # ==============================================================================
-# [Helper: 날짜 계산]
+# [Helper: 날짜 및 데이터 유틸리티]
 # ==============================================================================
 def get_last_complete_month_end():
     today = datetime.now()
@@ -59,7 +60,8 @@ def load_kr_data():
         if 'Symbol' in df.columns: df.rename(columns={'Symbol':'Code'}, inplace=True)
         df = df[~df['Name'].str.contains('스팩|우B|우|리츠|홀딩스', na=False)]
         if 'Amount' in df.columns:
-            df = df.sort_values('Amount', ascending=False).head(600)
+            # 유동성 상위 500개로 제한 (너무 많으면 타임아웃 발생)
+            df = df.sort_values('Amount', ascending=False).head(500)
         return df.set_index('Code')['Name'].to_dict(), df['Code'].tolist()
     except:
         return {"005930":"삼성전자"}, ["005930"]
@@ -94,207 +96,74 @@ def load_us_data(index_name='S&P 500'):
         return {"AAPL":"Apple"}, ["AAPL"]
 
 # ==============================================================================
-# [★ 핵심: 벡터화된 팩터 계산 (속도 10배 향상)]
+# [Core Logic: 팩터 계산]
 # ==============================================================================
-def calculate_factors_vectorized(p_sub, v_sub, min_amt, trading_days=252):
-    """
-    for문을 없애고 DataFrame 전체 연산으로 처리
-    """
-    # 1. 유동성 필터 (평균 거래대금)
-    amt = p_sub * v_sub
-    avg_amt = amt.tail(20).mean()
-    valid_stocks = avg_amt[avg_amt >= min_amt].index
-    
-    if len(valid_stocks) == 0: return pd.DataFrame()
-    
-    # 유효 종목만 남김
-    p = p_sub[valid_stocks]
-    # v = v_sub[valid_stocks] # v는 이제 안씀
-    avg_amt = avg_amt[valid_stocks]
+def calculate_factors(price, volume, min_amt, trading_days=252):
+    """중장기 퀀트 팩터"""
+    if len(price) < 60 + 20: return None 
+    amt_series = price * volume
+    avg_amt = amt_series.iloc[-20:].mean()
+    if avg_amt < min_amt: return None
 
-    # 2. 팩터 일괄 계산 (Vectorized)
-    # 마지막 날짜 기준
-    current_price = p.iloc[-1]
-    
-    # Momentum
-    mom_short = p.pct_change(20).iloc[-1]
-    mom_mid = p.pct_change(60).iloc[-1]
-    
-    # Volatility (Return Std * sqrt(252))
-    # pct_change 후 std 계산
-    daily_ret = p.pct_change()
-    vol = daily_ret.tail(trading_days).std() * np.sqrt(trading_days)
-    
-    # Liquidity Score (Log)
-    liquidity = np.log1p(avg_amt)
-    
-    # MDD (1년)
-    window = p.tail(trading_days)
-    roll_max = window.cummax()
-    dd = (window / roll_max) - 1.0
-    mdd = dd.min()
-    
-    # DataFrame 조립
-    factors = pd.DataFrame({
-        'mom_short': mom_short,
-        'mom_mid': mom_mid,
-        'volatility': vol,
-        'liquidity': liquidity,
-        'mdd': mdd,
-        'price': current_price
-    })
-    
-    return factors.dropna()
-
-# ==============================================================================
-# [NEW] 펀더멘털 & 베타 팩터 계산기 (실시간 분석용)
-# ==============================================================================
-def get_fundamental_factors(ticker, price_series, benchmark_series):
-    """
-    재무제표 데이터와 베타를 계산 (yfinance 전용)
-    """
     try:
-        stock = yf.Ticker(ticker)
+        mom_short = price.pct_change(20).iloc[-1]
+        mom_mid = price.pct_change(60).iloc[-1]
+        vol = price.pct_change().tail(trading_days).std() * np.sqrt(trading_days)
+        liquidity = np.log1p(avg_amt)
+        mdd = (price.tail(trading_days) / price.tail(trading_days).cummax() - 1).min()
         
-        # 1. 베타(Beta) & 시장 중립화 계수 계산
-        # 가격 데이터 길이를 맞춤
-        common_idx = price_series.index.intersection(benchmark_series.index)
-        if len(common_idx) < 60: return None
-        
-        p_ret = price_series.loc[common_idx].pct_change().dropna()
-        b_ret = benchmark_series.loc[common_idx].pct_change().dropna()
-        
-        # 공분산 / 분산
-        cov = np.cov(p_ret, b_ret)[0][1]
-        var = np.var(b_ret)
-        beta = cov / var if var != 0 else 1.0
-        
-        # 2. 재무 데이터 가져오기 (비동기 처리 안 하면 느림, 여기선 로직 구현 위주)
-        info = stock.info
-        fin = stock.financials
-        bal = stock.balance_sheet
-        cash = stock.cashflow
-        
-        # 데이터가 없으면 None 반환
-        if fin.empty or bal.empty or cash.empty: return None
-
-        # --- [A] 어닝 모멘텀 (EPS Growth) ---
-        # (EPS TTM - EPS 1년전) / abs(EPS 1년전)
-        # yfinance info에서 trailingEps 제공, 과거 데이터는 financials에서 추정
-        eps_ttm = info.get('trailingEps', None)
-        
-        # 재무제표는 연단위 혹은 분기단위. 여기선 최근 연간 기준 근사치 사용
-        # (정교한 4Q 전 데이터는 쿼터별 데이터가 필수이나 속도상 연간 데이터로 대용)
-        try:
-            eps_prev = fin.loc['Basic EPS'].iloc[1] # 작년 EPS
-        except: 
-            eps_prev = eps_ttm # 데이터 없으면 모멘텀 0 처리
-            
-        if eps_ttm and eps_prev:
-            earn_mom = (eps_ttm - eps_prev) / abs(eps_prev)
-        else:
-            earn_mom = 0.0
-
-        # --- [B] 퀄리티 (Quality) ---
-        # ROE, Gross Margin, Operating Margin
-        roe = info.get('returnOnEquity', 0)
-        gm = info.get('grossMargins', 0)
-        om = info.get('operatingMargins', 0)
-        
-        # --- [C] 회계 정직성 (Accruals) ---
-        # Accrual = (Net Income - Operating Cash Flow) / Total Assets
-        # 발생액이 높으면(현금흐름보다 순이익이 과도하게 높으면) 분식회계/이익조정 의심 -> 낮을수록 좋음
-        try:
-            ni = cash.loc['Net Income'].iloc[0] if 'Net Income' in cash.index else fin.loc['Net Income'].iloc[0]
-            ocf = cash.loc['Operating Cash Flow'].iloc[0] if 'Operating Cash Flow' in cash.index else cash.loc['Total Cash From Operating Activities'].iloc[0]
-            assets = bal.loc['Total Assets'].iloc[0]
-            
-            accrual = (ni - ocf) / assets if assets != 0 else 0
-        except:
-            accrual = 0.0 # 데이터 없으면 중립 처리
-
         return {
-            'beta': beta,
-            'earn_mom': earn_mom,
-            'roe': roe,
-            'gross_margin': gm,
-            'oper_margin': om,
-            'accrual': accrual
+            'mom_short': mom_short, 'mom_mid': mom_mid,
+            'volatility': vol, 'liquidity': liquidity, 'mdd': mdd,
+            'price': price.iloc[-1]
         }
+    except: return None
+
+def calculate_short_term_factors(price, volume):
+    """단타/스윙 전용 팩터"""
+    if len(price) < 20: return None
+    try:
+        mom_1d = price.pct_change(1).iloc[-1]
+        mom_3d = price.pct_change(3).iloc[-1]
+        mom_5d = price.pct_change(5).iloc[-1]
         
-    except Exception as e:
-        return None
+        vol_avg_5d = volume.iloc[-6:-1].mean()
+        vol_today = volume.iloc[-1]
+        vol_spike = vol_today / vol_avg_5d if vol_avg_5d > 0 else 0
+        
+        recent_vol = price.tail(5).std() / price.tail(5).mean()
+        ma_20 = price.tail(20).mean()
+        disparity = (price.iloc[-1] / ma_20) * 100
+        
+        return {
+            'mom_1d': mom_1d, 'mom_3d': mom_3d, 'mom_5d': mom_5d,
+            'vol_spike': vol_spike, 'recent_vol': recent_vol, 
+            'disparity': disparity, 'price': price.iloc[-1]
+        }
+    except: return None
 
 def rank_and_score(factor_df, weights):
     if factor_df.empty: return factor_df
     scored = factor_df.copy()
-    
-    # 1. 기술적 팩터 랭킹 (기존)
     scored['R_Mom_S'] = scored['mom_short'].rank(pct=True)
     scored['R_Mom_M'] = scored['mom_mid'].rank(pct=True)
     scored['R_Vol'] = scored['volatility'].rank(pct=True, ascending=False)
     scored['R_Liq'] = scored['liquidity'].rank(pct=True)
     scored['R_MDD'] = scored['mdd'].rank(pct=True)
     
-    # 2. 펀더멘털 팩터 랭킹 (데이터가 있는 경우에만)
-    if 'earn_mom' in scored.columns:
-        # Quality Composite Score 계산
-        # 0.4 * ROE + 0.3 * GM + 0.3 * OM
-        scored['Quality_Raw'] = (
-            0.4 * scored['roe'].fillna(0).rank(pct=True) + 
-            0.3 * scored['gross_margin'].fillna(0).rank(pct=True) + 
-            0.3 * scored['oper_margin'].fillna(0).rank(pct=True)
-        )
-        
-        scored['R_Qual'] = scored['Quality_Raw'].rank(pct=True) # 퀄리티 높을수록 좋음
-        scored['R_Earn'] = scored['earn_mom'].fillna(0).rank(pct=True) # 이익모멘텀 높을수록 좋음
-        scored['R_Acc'] = scored['accrual'].fillna(0).rank(pct=True, ascending=False) # 발생액 낮을수록 좋음 (Ascending=False)
-    else:
-        # 펀더멘털 데이터 없으면 0 처리
-        scored['R_Qual'] = 0.5
-        scored['R_Earn'] = 0.5
-        scored['R_Acc'] = 0.5
-
-    # 3. 종합 점수 계산 (가중치 적용)
-    # 기존 가중치에 펀더멘털 가중치(임의 설정: 퀄리티/이익/회계 각각 0.5 정도의 영향력 가정)
-    # 사용자가 슬라이더로 조절하게 하려면 weights 딕셔너리에 키를 추가해야 함.
-    # 여기서는 "스마트 머니" 프리셋 등의 논리에 녹여내기 위해 기본 점수에 가산점 형태로 추가합니다.
-    
-    base_score = (
+    total = (
         (scored['R_Mom_S'] * 0.5 + scored['R_Mom_M'] * 0.5) * weights['mom'] +
         scored['R_Vol'] * weights['vol'] +
         scored['R_Liq'] * weights['liq'] +
         scored['R_MDD'] * weights['risk']
     )
-    
-    # 펀더멘털 가산점 (Fundamental Boost) - 약 30% 비중
-    fund_score = (scored['R_Qual'] + scored['R_Earn'] + scored['R_Acc']) / 3
-    
-    # 최종 점수 (기술적 70% + 펀더멘털 30%)
-    total_score = base_score * 0.7 + fund_score * 0.3
-    
-    # 정규화 (0~100)
-    scored['Raw_Total'] = (total_score / (sum(weights.values()) * 0.7 + 0.3)) * 100
-    
-    # 4. 시장 중립화 (Beta Neutralization)
-    # Alpha = Score - (Beta * Market_Factor)
-    # Market_Factor는 시장의 평균적인 과열도라고 가정 (여기선 50점으로 고정하거나 전체 평균 사용)
-    if 'beta' in scored.columns:
-        market_bias = 50 # 기준점
-        # 베타가 1보다 크면 점수를 깎고(고위험), 1보다 작으면 점수를 높여줌(저변동)
-        # 단, 상승장에서는 베타 높은게 좋으므로, 이 로직은 "안정성"을 중시하는 Alpha 로직임.
-        scored['Alpha_Score'] = scored['Raw_Total'] - (scored['beta'] * (scored['Raw_Total'].mean() * 0.2)) 
-        # 설명: 베타가 높을수록 전체 평균점수의 20%만큼 페널티를 부여 (로우 베타 선호)
-        
-        # 최종적으로 Alpha Score 사용
-        scored['Total_Score'] = scored['Alpha_Score']
-    else:
-        scored['Total_Score'] = scored['Raw_Total']
-
+    weight_sum = sum(weights.values())
+    if weight_sum == 0: weight_sum = 1
+    scored['Total_Score'] = (total / weight_sum) * 100
     return scored.sort_values(by='Total_Score', ascending=False)
 
 # ==============================================================================
-# [백테스트 데이터 페처]
+# [백테스트 데이터 페처] (안정성 강화 패치 적용)
 # ==============================================================================
 @st.cache_data(ttl=3600*24)
 def fetch_backtest_data(universe, start_date, end_date, country):
@@ -302,7 +171,7 @@ def fetch_backtest_data(universe, start_date, end_date, country):
     p, v = {}, {}
     bm = pd.Series(dtype=float)
     
-    # Benchmark
+    # 1. 벤치마크 데이터 로딩
     try:
         if country == "KR": 
             bm = fdr.DataReader('KS11', s_str, e_str)['Close']
@@ -315,23 +184,28 @@ def fetch_backtest_data(universe, start_date, end_date, country):
         
         if hasattr(bm.index, 'tz_localize'):
             bm.index = pd.to_datetime(bm.index).tz_localize(None)
-    except: pass
+    except Exception as e:
+        st.warning(f"벤치마크 로딩 실패 (수익률 비교 불가): {e}")
 
-    # Data Fetching
+    # 2. 개별 종목 데이터 로딩 (스레드 조절로 안정성 확보)
     def get(code):
         try:
             if country == "KR": d = fdr.DataReader(code, s_str, e_str)
-            else: return None
+            else: return None 
             d.index = pd.to_datetime(d.index).tz_localize(None)
             return code, d['Close'], d['Volume']
         except: return None
 
     if country == "KR":
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        # [수정] Worker 수를 4로 줄여서 IP 차단 방지 (안전제일)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
             futures = [ex.submit(get, c) for c in universe]
             for fut in concurrent.futures.as_completed(futures):
                 res = fut.result()
-                if res: p[res[0]], v[res[0]] = res[1], res[2]
+                if res: 
+                    # 데이터가 너무 짧으면 제외 (1년 미만)
+                    if len(res[1]) > 200: 
+                        p[res[0]], v[res[0]] = res[1], res[2]
     else:
         try:
             d = yf.download(universe, start=s_str, end=e_str, group_by='ticker', progress=False, threads=True)
@@ -345,88 +219,64 @@ def fetch_backtest_data(universe, start_date, end_date, country):
                         vo = d[t]['Volume'] if 'Volume' in d[t] else None
                         s.index = pd.to_datetime(s.index).tz_localize(None)
                         if vo is not None: vo.index = pd.to_datetime(vo.index).tz_localize(None)
-                        p[t], v[t] = s, vo
+                        if len(s) > 200: p[t], v[t] = s, vo
         except: pass
 
     return pd.DataFrame(p), pd.DataFrame(v), bm
 
 # ==============================================================================
-# [★ 핵심 백테스트 엔진 (T+1 실행 & 벡터화 적용)]
+# [★ 핵심 백테스트 엔진]
 # ==============================================================================
 def run_backtest(prices, volumes, benchmark, weights, ticker_map, const):
     if prices.empty: return pd.DataFrame()
     
-    # 1. 리밸런싱 날짜: 월말 (Signal Date)
+    # 리밸런싱 날짜 생성 (월말 기준)
     reb_dates = prices.resample('BM').last().dropna(how='all').index
     
     logs = []
     prev_picks = [] 
     
     for i in range(12, len(reb_dates)-1):
-        signal_date = reb_dates[i]      # 이번달 말일 (시그널 발생)
-        next_signal_date = reb_dates[i+1] # 다음달 말일 (다음 시그널)
+        rebal_date = reb_dates[i]       
+        next_rebal = reb_dates[i+1]     
         
-        # 2. 실행 날짜 (T+1) 계산: signal_date 다음 거래일 찾기
-        # 전체 인덱스에서 signal_date의 위치를 찾고 +1
-        try:
-            sig_loc = prices.index.get_loc(signal_date)
-            if sig_loc + 1 >= len(prices): break # 데이터 끝이면 중단
-            
-            buy_date = prices.index[sig_loc + 1] # 익월 첫 거래일 (매수)
-            
-            # 매도 날짜: 다음달 시그널 다음 거래일 (다음달 리밸런싱 매수일 = 이번달 매도일)
-            next_sig_loc = prices.index.get_loc(next_signal_date)
-            if next_sig_loc + 1 >= len(prices): 
-                sell_date = prices.index[-1] # 데이터 끝이면 마지막 날 매도
-            else:
-                sell_date = prices.index[next_sig_loc + 1] # 익익월 첫 거래일 (매도)
-                
-        except (KeyError, IndexError):
-            continue
-
-        # -----------------------------------------------------------
-        # [A] 팩터 계산 (Vectorized)
-        # -----------------------------------------------------------
-        # signal_date 기준 데이터 슬라이싱
-        p_sub = prices.loc[:signal_date].tail(300)
-        v_sub = volumes.loc[:signal_date].tail(300)
+        # [A] 팩터 계산
+        p_sub = prices.loc[:rebal_date].tail(300)
+        v_sub = volumes.loc[:rebal_date].tail(300)
+        active_tickers = p_sub.columns[p_sub.iloc[-1].notna()]
         
-        # 벡터화 함수 호출 (Loop 없음! 쾌적!)
-        factor_df = calculate_factors_vectorized(p_sub, v_sub, const['MIN_AMT'])
-        if factor_df.empty: continue
+        daily_factors = []
+        for t in active_tickers:
+            f = calculate_factors(p_sub[t], v_sub[t], const['MIN_AMT'])
+            if f:
+                f['code'] = t
+                daily_factors.append(f)
         
+        if not daily_factors: continue
+        
+        factor_df = pd.DataFrame(daily_factors).set_index('code')
         ranked = rank_and_score(factor_df, weights)
         picks = ranked.head(const['TOP_N']).index.tolist()
         
         if not picks: continue
         
-        # -----------------------------------------------------------
-        # [B] 수익률 계산 (T+1 ~ Next T+1)
-        # -----------------------------------------------------------
+        # [B] 수익률 계산
         try:
-            # 매수가: buy_date 종가
-            # 매도가: sell_date 종가
-            curr_prices = prices.loc[buy_date, picks].fillna(0)
-            next_prices = prices.loc[sell_date, picks].fillna(0)
+            curr_prices = prices.loc[rebal_date, picks].fillna(0)
+            next_prices = prices.loc[next_rebal, picks].fillna(0)
             
-            # 0원(상폐/정지) 처리: 0이면 매수 불가 -> 제외하거나 ffill 시도
-            # 보수적 접근: 매수가 0이면 수익률 0 (현금보유 효과)
-            valid_idx = (curr_prices > 0) & (next_prices > 0)
+            if (curr_prices == 0).any(): 
+                curr_prices = curr_prices.replace(0, np.nan).ffill()
             
-            if valid_idx.sum() == 0:
-                gross_ret = 0.0
-            else:
-                curr_p = curr_prices[valid_idx]
-                next_p = next_prices[valid_idx]
-                asset_returns = (next_p / curr_p) - 1
-                gross_ret = asset_returns.mean()
+            asset_returns = (next_prices / curr_prices) - 1
+            asset_returns = asset_returns.fillna(0)
+            
+            gross_ret = asset_returns.mean()
             
         except Exception as e:
             continue
 
-        # -----------------------------------------------------------
         # [C] 비용 계산 (Turnover)
-        # -----------------------------------------------------------
         if not prev_picks: turnover_rate = 1.0 
         else:
             kept_stocks = set(prev_picks) & set(picks)
@@ -435,20 +285,22 @@ def run_backtest(prices, volumes, benchmark, weights, ticker_map, const):
         real_cost = turnover_rate * const['COST_RATE']
         net_ret = gross_ret - real_cost
         
-        # -----------------------------------------------------------
-        # [D] 벤치마크 (T+1 기간 매칭)
-        # -----------------------------------------------------------
+        # [D] 벤치마크
         try:
-            bm_s = benchmark.asof(buy_date)
-            bm_e = benchmark.asof(sell_date)
-            bm_ret = (bm_e / bm_s) - 1 if (bm_s > 0) else 0.0
-        except: bm_ret = 0.0
+            if isinstance(benchmark, pd.Series):
+                bm_s = benchmark.asof(rebal_date)
+                bm_e = benchmark.asof(next_rebal)
+            else:
+                bm_s = benchmark.loc[:rebal_date].iloc[-1] if len(benchmark.loc[:rebal_date]) > 0 else 0
+                bm_e = benchmark.loc[:next_rebal].iloc[-1] if len(benchmark.loc[:next_rebal]) > 0 else 0
             
-        # -----------------------------------------------------------
-        # [E] 기록
-        # -----------------------------------------------------------
+            if pd.isna(bm_s) or bm_s == 0: bm_ret = 0.0
+            else: bm_ret = (bm_e / bm_s) - 1
+        except:
+            bm_ret = 0.0
+            
         logs.append({
-            'Date': sell_date, # 수익 실현일 기준
+            'Date': next_rebal,
             'Gross_Ret': gross_ret,     
             'Net_Ret': net_ret,         
             'BM_Ret': bm_ret,
@@ -511,7 +363,7 @@ def highlight_top3(s):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🌍 Alpha Seeking Pro (The Real)")
+st.title("🌍 Alpha Seeking Pro (Final Stable)")
 
 with st.sidebar:
     st.header("🏳️ 시장 선택")
@@ -520,7 +372,7 @@ with st.sidebar:
     
     if "한국" in market:
         COUNTRY, CURRENCY, COST_RATE, MIN_AMT, VIX_TICKER, BM_NAME = "KR", "원", 0.002, 5_000_000_000, "KS200VIX", "KOSPI"
-        st.info("대상: 유동성 상위 600개")
+        st.info("대상: 유동성 상위 500개")
         TICKER_INFO, ALL_STOCKS = load_kr_data()
     else:
         COUNTRY, CURRENCY, COST_RATE, MIN_AMT, VIX_TICKER, BM_NAME = "US", "$", 0.0005, 5_000_000, "^VIX", "S&P 500"
@@ -535,7 +387,7 @@ with st.sidebar:
     mode = st.radio("모드 선택", ["📊 실시간 랭킹", "⚡ 단타/스윙", "🎰 포트폴리오", "📉 백테스트", "🔍 전략 최적화"])
     st.divider()
     
-    # [16개 프리셋 복구]
+    # [16개 프리셋 탑재]
     PRESETS = {
         "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
         "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🌊 세력주 포착": (0.4, 1.0, 0.2, 0.2),
@@ -571,31 +423,14 @@ if mode == "📊 실시간 랭킹":
         results = []
         bar = st.progress(0, text="스캔 중...")
         
-def worker(t):
+        def worker(t):
             try:
                 days = 400 if COUNTRY=="KR" else 730
-                if COUNTRY=="KR": 
-                    df = fdr.DataReader(t, (datetime.now()-timedelta(days=days)).strftime('%Y-%m-%d'))
-                    # KRX 데이터는 베타 계산용 벤치마크 필요
-                    bm = fdr.DataReader('KS11', (datetime.now()-timedelta(days=days)).strftime('%Y-%m-%d'))['Close']
-                else: 
-                    df = yf.Ticker(t).history(period="2y")
-                    bm = yf.Ticker("^GSPC").history(period="2y")['Close']
+                if COUNTRY=="KR": df = fdr.DataReader(t, (datetime.now()-timedelta(days=days)).strftime('%Y-%m-%d'))
+                else: df = yf.Ticker(t).history(period="2y")
                 
                 if len(df)<200: return None
-                
-                # 1. 기술적 팩터
                 f = calculate_factors(df['Close'], df['Volume'], MIN_AMT)
-                
-                # 2. 펀더멘털 팩터 (미국주식인 경우에만 활성화 권장 - 속도 이슈)
-                # 한국 주식은 FDR에서 펀더멘털 얻기 힘드므로 제외하거나 별도 크롤링 필요
-                # 여기선 예시로 미국 주식일 때만 펀더멘털 가져오도록 설정 (속도 때문)
-                if f and COUNTRY == "US": 
-                    fund = get_fundamental_factors(t, df['Close'], bm)
-                    if fund: f.update(fund) # 딕셔너리 합치기
-                
-                # 한국 주식은 펀더멘털 팩터를 중립(None)으로 둬서 랭킹에서 중간값 받게 처리
-                
                 if f: f['code'] = t
                 return f
             except: return None
@@ -689,11 +524,16 @@ elif mode == "📉 백테스트":
     with c2: e_d = st.date_input("종료", get_last_complete_month_end())
     
     if st.button("실행", type="primary"):
-        with st.spinner("시뮬레이션..."):
+        with st.spinner("시뮬레이션... (KRX는 속도 제한으로 시간이 걸릴 수 있습니다)"):
             u = ALL_STOCKS[:400] if len(ALL_STOCKS)>400 else ALL_STOCKS
             p, v, bm = fetch_backtest_data(u, s_d, e_d, COUNTRY)
             
             if not p.empty:
+                # [데이터 진단]
+                with st.expander("🛠️ 데이터 진단 (수집된 기간 확인)", expanded=False):
+                    st.write(f"📅 시작: {p.index[0].date()} | 종료: {p.index[-1].date()}")
+                    st.write(f"📊 수집 종목 수: {len(p.columns)}개")
+                
                 res = run_backtest(p, v, bm, weights, TICKER_INFO, CONST)
                 if not res.empty:
                     res = res.set_index('Date')
@@ -716,6 +556,7 @@ elif mode == "📉 백테스트":
                 else: st.error("백테스트 결과가 없습니다.")
             else:
                 st.error("❌ 데이터 로딩 실패")
+                st.info("💡 Tip: '캐시 초기화' 버튼을 누르거나 잠시 후 다시 시도해보세요.")
 
 else: # 최적화
     c1, c2 = st.columns(2)
