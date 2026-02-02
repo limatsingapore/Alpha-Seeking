@@ -571,14 +571,31 @@ if mode == "📊 실시간 랭킹":
         results = []
         bar = st.progress(0, text="스캔 중...")
         
-        def worker(t):
+def worker(t):
             try:
                 days = 400 if COUNTRY=="KR" else 730
-                if COUNTRY=="KR": df = fdr.DataReader(t, (datetime.now()-timedelta(days=days)).strftime('%Y-%m-%d'))
-                else: df = yf.Ticker(t).history(period="2y")
+                if COUNTRY=="KR": 
+                    df = fdr.DataReader(t, (datetime.now()-timedelta(days=days)).strftime('%Y-%m-%d'))
+                    # KRX 데이터는 베타 계산용 벤치마크 필요
+                    bm = fdr.DataReader('KS11', (datetime.now()-timedelta(days=days)).strftime('%Y-%m-%d'))['Close']
+                else: 
+                    df = yf.Ticker(t).history(period="2y")
+                    bm = yf.Ticker("^GSPC").history(period="2y")['Close']
                 
                 if len(df)<200: return None
-                f = calculate_factors(df['Close'], df['Volume'], MIN_AMT) # 실시간은 기존 함수 사용 (한 종목씩)
+                
+                # 1. 기술적 팩터
+                f = calculate_factors(df['Close'], df['Volume'], MIN_AMT)
+                
+                # 2. 펀더멘털 팩터 (미국주식인 경우에만 활성화 권장 - 속도 이슈)
+                # 한국 주식은 FDR에서 펀더멘털 얻기 힘드므로 제외하거나 별도 크롤링 필요
+                # 여기선 예시로 미국 주식일 때만 펀더멘털 가져오도록 설정 (속도 때문)
+                if f and COUNTRY == "US": 
+                    fund = get_fundamental_factors(t, df['Close'], bm)
+                    if fund: f.update(fund) # 딕셔너리 합치기
+                
+                # 한국 주식은 펀더멘털 팩터를 중립(None)으로 둬서 랭킹에서 중간값 받게 처리
+                
                 if f: f['code'] = t
                 return f
             except: return None
