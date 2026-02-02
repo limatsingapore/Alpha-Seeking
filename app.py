@@ -13,7 +13,7 @@ import requests
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v5.0)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v5.1)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -43,7 +43,7 @@ CONST = {
 # [Helper Functions]
 # ==============================================================================
 def get_last_complete_month_end():
-    return datetime.now() # 오늘 날짜까지 조회 (데이터 잘림 방지)
+    return datetime.now() 
 
 def z_score(x):
     if x.std() == 0: return x * 0
@@ -72,7 +72,7 @@ def infer_sector_kr(name):
     return '기타/소형주'
 
 # ==============================================================================
-# [NEW] 벤치마크 통합 로딩 함수 (사용자 요청 반영 1)
+# [NEW] 벤치마크 통합 로딩 함수
 # ==============================================================================
 @st.cache_data(ttl=3600*24)
 def load_benchmarks(country, start, end):
@@ -82,7 +82,6 @@ def load_benchmarks(country, start, end):
     
     try:
         if country == "KR":
-            # KRX 지수
             try: bm['KOSPI'] = fdr.DataReader('KS11', s_str, e_str)['Close']
             except: pass
             try: bm['KOSDAQ'] = fdr.DataReader('KQ11', s_str, e_str)['Close']
@@ -90,7 +89,6 @@ def load_benchmarks(country, start, end):
             try: bm['KOSPI200'] = fdr.DataReader('KS200', s_str, e_str)['Close']
             except: pass
         else:
-            # US 지수
             tickers = {'S&P500': '^GSPC', 'NASDAQ': '^IXIC', 'DOW': '^DJI'}
             for name, ticker in tickers.items():
                 try:
@@ -105,13 +103,12 @@ def load_benchmarks(country, start, end):
                     
                     bm[name] = series
                 except: pass
-    except Exception as e:
-        print(f"Benchmark Load Error: {e}")
+    except: pass
         
     return bm
 
 # ==============================================================================
-# [데이터 로더 - 개별 종목]
+# [데이터 로더]
 # ==============================================================================
 @st.cache_data(ttl=3600*12)
 def load_kr_data():
@@ -143,6 +140,7 @@ def load_us_data(index_name='S&P 500'):
         for t in tables:
             if any(k in t.columns for k in ['Symbol', 'Ticker']):
                 df = t; break
+        
         if df is None: raise ValueError("Table Not Found")
         
         rename_map = {'Symbol': 'Code', 'Ticker': 'Code', 'Security': 'Name', 'Company': 'Name'}
@@ -281,21 +279,19 @@ def rank_and_score(factor_df, weights, ticker_map=None):
     return scored.sort_values(by='Total_Score', ascending=False)
 
 # ==============================================================================
-# [백테스트 데이터 페처] (벤치마크 로딩 분리)
+# [백테스트 데이터 페처] (벤치마크 로딩 제거)
 # ==============================================================================
 @st.cache_data(ttl=3600*24)
 def fetch_backtest_data(universe, start_date, end_date, country):
     s_str, e_str = start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
     p, v = {}, {}
     
-    # 벤치마크는 여기서 로딩하지 않고 load_benchmarks 함수 사용
-    
     def get(code):
         try:
             if country == "KR": d = fdr.DataReader(code, s_str, e_str)
             else: return None 
             d.index = pd.to_datetime(d.index).tz_localize(None)
-            # 최근 데이터까지 확실히 가져오기 위해 ffill 적용
+            # 최근 데이터까지 확실하게 포함되도록 ffill
             return code, d['Close'].ffill(), d['Volume'].fillna(0)
         except: return None
 
@@ -322,8 +318,10 @@ def fetch_backtest_data(universe, start_date, end_date, country):
                         if len(s) > 100: p[t], v[t] = s.ffill(), vo.fillna(0)
         except: pass
 
+    # [중요] 전체 데이터프레임의 인덱스를 합집합으로 재설정하여 날짜 누락 방지
     df_p = pd.DataFrame(p)
     df_v = pd.DataFrame(v)
+    
     if not df_p.empty:
         full_idx = pd.date_range(start=df_p.index.min(), end=df_p.index.max(), freq='B')
         df_p = df_p.reindex(full_idx).ffill()
@@ -332,13 +330,17 @@ def fetch_backtest_data(universe, start_date, end_date, country):
     return df_p, df_v
 
 # ==============================================================================
-# [백테스트 엔진]
+# [백테스트 엔진] (수정: 인자 불일치 해결 및 벤치마크 처리)
 # ==============================================================================
-def run_backtest(prices, volumes, weights, ticker_map, const):
+def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
     if prices.empty: return pd.DataFrame()
     reb_dates = prices.resample('BM').last().index
     logs, prev_picks = [], []
     
+    # benchmark가 None일 경우 빈 시리즈로 처리
+    if benchmark is None or benchmark.empty:
+        benchmark = pd.Series(0, index=prices.index)
+
     for i in range(12, len(reb_dates)):
         rebal_date = reb_dates[i]
         if i < len(reb_dates) - 1: next_rebal = reb_dates[i+1]
@@ -387,9 +389,21 @@ def run_backtest(prices, volumes, weights, ticker_map, const):
             turnover = (const['TOP_N'] - len(kept)) / const['TOP_N']
             
         net_ret = gross_ret - (turnover * const['COST_RATE'])
+        
+        # 벤치마크 수익률 계산 (안전하게)
+        try:
+            if isinstance(benchmark, pd.Series) and not benchmark.empty:
+                b_s = benchmark.asof(buy_date)
+                b_e = benchmark.asof(sell_date)
+                if pd.isna(b_s) or b_s == 0: bm_ret = 0.0
+                else: bm_ret = (b_e / b_s) - 1
+            else:
+                bm_ret = 0.0
+        except: bm_ret = 0.0
+            
         logs.append({
             'Date': sell_date, 'Gross_Ret': gross_ret, 'Net_Ret': net_ret,
-            'Turnover': turnover, 'Holdings_Full': ", ".join([ticker_map.get(x,x) for x in picks]),
+            'BM_Ret': bm_ret, 'Turnover': turnover, 'Holdings_Full': ", ".join([ticker_map.get(x,x) for x in picks]),
             'Port_Ret': net_ret
         })
         prev_picks = picks
@@ -397,17 +411,21 @@ def run_backtest(prices, volumes, weights, ticker_map, const):
     return pd.DataFrame(logs)
 
 # ==============================================================================
-# [전략 최적화]
+# [전략 최적화] (수정: 인자 전달 방식 개선)
 # ==============================================================================
 def optimize_strategy(prices, volumes, ticker_map, presets, const):
     results = []
     if prices.empty: return pd.DataFrame()
     prog = st.progress(0, text="시뮬레이션 시작...")
     
+    # 최적화에서는 벤치마크 비교가 핵심이 아니므로 None 전달하여 속도 향상
+    # (필요시 fetch_backtest_data에서 benchmark를 받아와서 넘길 수도 있음)
+    
     for i, (name, w) in enumerate(presets.items()):
         weights = {'mom': w[0], 'liq': w[1], 'vol': w[2], 'risk': w[3]}
         try:
-            res = run_backtest(prices, volumes, weights, ticker_map, const)
+            # benchmark=None 전달
+            res = run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None)
             if not res.empty:
                 res = res.set_index('Date')
                 res['Cum'] = (1+res['Port_Ret']).cumprod()
@@ -446,7 +464,7 @@ def highlight_top3(s):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🌍 Alpha Seeking Pro (Final v5.0)")
+st.title("🌍 Alpha Seeking Pro (Final v5.1)")
 
 with st.sidebar:
     st.header("🏳️ 시장 선택")
@@ -610,25 +628,24 @@ elif mode == "📉 백테스트":
         with st.spinner("시뮬레이션..."):
             u = ALL_STOCKS[:400] if len(ALL_STOCKS)>400 else ALL_STOCKS
             p, v = fetch_backtest_data(u, s_d, e_d, COUNTRY)
-            # [사용자 요청 1: 벤치마크 통합 로드]
             bms = load_benchmarks(COUNTRY, s_d, e_d)
             
             if not p.empty:
-                res = run_backtest(p, v, weights, TICKER_INFO, CONST)
+                # benchmark 인자 전달 (주요 지수 중 하나 선택)
+                main_bm = list(bms.values())[0] if bms else None
+                
+                res = run_backtest(p, v, weights, TICKER_INFO, CONST, benchmark=main_bm)
                 if not res.empty:
                     res = res.set_index('Date')
                     res['Cum'] = (1+res['Port_Ret']).cumprod()
-                    
-                    # [사용자 요청 2: 차트 렌더링 개선]
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(x=res.index, y=res['Cum'], name="Strategy", line=dict(width=3, color='#3b82f6')))
                     
-                    colors = ['#ef4444', '#10b981', '#f59e0b'] # Red, Green, Orange
+                    colors = ['#ef4444', '#10b981', '#f59e0b']
                     for i, (b_name, b_data) in enumerate(bms.items()):
                         try:
-                            # 전략과 인덱스 매칭
                             b = b_data.reindex(res.index, method='ffill')
-                            b = b / b.iloc[0] # 정규화
+                            b = b / b.iloc[0]
                             fig.add_trace(go.Scatter(x=b.index, y=b, name=b_name, line=dict(dash='dot', color=colors[i%3])))
                         except: pass
                         
@@ -645,14 +662,14 @@ else: # 최적화
     with c2: e_d = st.date_input("종료", get_last_complete_month_end())
     
     if st.button("전체 전략 비교"):
-        with st.spinner("15+개 전략 시뮬레이션..."):
+        with st.spinner("시뮬레이션..."):
             u = ALL_STOCKS[:400] if len(ALL_STOCKS)>400 else ALL_STOCKS
             p, v = fetch_backtest_data(u, s_d, e_d, COUNTRY)
-            bms = load_benchmarks(COUNTRY, s_d, e_d) # 로딩
             
             if not p.empty:
                 presets = {k:v for k,v in PRESETS.items() if k!="사용자 정의"}
-                res = optimize_strategy(p, v, None, TICKER_INFO, presets, CONST)
+                # 여기서는 benchmark=None (속도 최적화)
+                res = optimize_strategy(p, v, ticker_map=TICKER_INFO, presets=presets, const=CONST)
                 if not res.empty:
                     st.dataframe(res.style.apply(highlight_top3, subset=['승률', 'CAGR', '누적수익', 'MDD', '샤프', '변동성'])
                                  .format({'승률':'{:.1%}', 'CAGR':'{:.1%}', '누적수익':'{:.1%}', 'MDD':'{:.1%}', '샤프':'{:.2f}', '변동성':'{:.1%}'}), 
@@ -664,19 +681,23 @@ else: # 최적화
                     parts = ws_str.split('|')
                     w_dict = {'mom': float(parts[0]), 'liq': float(parts[1]), 'vol': float(parts[2]), 'risk': float(parts[3])}
                     
-                    res_best = run_backtest(p, v, w_dict, TICKER_INFO, CONST)
+                    # 1등 전략 상세 차트
+                    bms = load_benchmarks(COUNTRY, s_d, e_d)
+                    main_bm = list(bms.values())[0] if bms else None
+                    res_best = run_backtest(p, v, w_dict, TICKER_INFO, CONST, benchmark=main_bm)
+                    
                     if not res_best.empty:
                         res_best = res_best.set_index('Date')
                         res_best['Cum'] = (1+res_best['Port_Ret']).cumprod()
                         fig = go.Figure()
-                        fig.add_trace(go.Scatter(x=res_best.index, y=res_best['Cum'], name=best['전략명'], line=dict(width=3)))
+                        fig.add_trace(go.Scatter(x=res_best.index, y=res_best['Cum'], name=best['전략명'], line=dict(color='#FFD700', width=2)))
                         
-                        # 벤치마크 3개 그리기
+                        colors = ['#ef4444', '#10b981', '#f59e0b']
                         for i, (b_name, b_data) in enumerate(bms.items()):
                             try:
                                 b = b_data.reindex(res_best.index, method='ffill')
                                 b = b / b.iloc[0]
-                                fig.add_trace(go.Scatter(x=b.index, y=b, name=b_name, line=dict(dash='dot')))
+                                fig.add_trace(go.Scatter(x=b.index, y=b, name=b_name, line=dict(dash='dot', color=colors[i%3])))
                             except: pass
                         st.plotly_chart(fig, use_container_width=True)
             else: st.error("데이터 로딩 실패")
