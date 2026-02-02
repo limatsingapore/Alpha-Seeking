@@ -150,22 +150,68 @@ def rank_and_score(factor_df, weights):
     if factor_df.empty: return factor_df
     scored = factor_df.copy()
     
-    # 랭킹 (Percentile)
+    # 1. 기술적 팩터 랭킹 (기존)
     scored['R_Mom_S'] = scored['mom_short'].rank(pct=True)
     scored['R_Mom_M'] = scored['mom_mid'].rank(pct=True)
-    scored['R_Vol'] = scored['volatility'].rank(pct=True, ascending=False) # 낮을수록 좋음
+    scored['R_Vol'] = scored['volatility'].rank(pct=True, ascending=False)
     scored['R_Liq'] = scored['liquidity'].rank(pct=True)
-    scored['R_MDD'] = scored['mdd'].rank(pct=True) # 0에 가까울수록(큰값일수록) 좋음
+    scored['R_MDD'] = scored['mdd'].rank(pct=True)
     
-    total = (
+    # 2. 펀더멘털 팩터 랭킹 (데이터가 있는 경우에만)
+    if 'earn_mom' in scored.columns:
+        # Quality Composite Score 계산
+        # 0.4 * ROE + 0.3 * GM + 0.3 * OM
+        scored['Quality_Raw'] = (
+            0.4 * scored['roe'].fillna(0).rank(pct=True) + 
+            0.3 * scored['gross_margin'].fillna(0).rank(pct=True) + 
+            0.3 * scored['oper_margin'].fillna(0).rank(pct=True)
+        )
+        
+        scored['R_Qual'] = scored['Quality_Raw'].rank(pct=True) # 퀄리티 높을수록 좋음
+        scored['R_Earn'] = scored['earn_mom'].fillna(0).rank(pct=True) # 이익모멘텀 높을수록 좋음
+        scored['R_Acc'] = scored['accrual'].fillna(0).rank(pct=True, ascending=False) # 발생액 낮을수록 좋음 (Ascending=False)
+    else:
+        # 펀더멘털 데이터 없으면 0 처리
+        scored['R_Qual'] = 0.5
+        scored['R_Earn'] = 0.5
+        scored['R_Acc'] = 0.5
+
+    # 3. 종합 점수 계산 (가중치 적용)
+    # 기존 가중치에 펀더멘털 가중치(임의 설정: 퀄리티/이익/회계 각각 0.5 정도의 영향력 가정)
+    # 사용자가 슬라이더로 조절하게 하려면 weights 딕셔너리에 키를 추가해야 함.
+    # 여기서는 "스마트 머니" 프리셋 등의 논리에 녹여내기 위해 기본 점수에 가산점 형태로 추가합니다.
+    
+    base_score = (
         (scored['R_Mom_S'] * 0.5 + scored['R_Mom_M'] * 0.5) * weights['mom'] +
         scored['R_Vol'] * weights['vol'] +
         scored['R_Liq'] * weights['liq'] +
         scored['R_MDD'] * weights['risk']
     )
-    weight_sum = sum(weights.values())
-    if weight_sum == 0: weight_sum = 1
-    scored['Total_Score'] = (total / weight_sum) * 100
+    
+    # 펀더멘털 가산점 (Fundamental Boost) - 약 30% 비중
+    fund_score = (scored['R_Qual'] + scored['R_Earn'] + scored['R_Acc']) / 3
+    
+    # 최종 점수 (기술적 70% + 펀더멘털 30%)
+    total_score = base_score * 0.7 + fund_score * 0.3
+    
+    # 정규화 (0~100)
+    scored['Raw_Total'] = (total_score / (sum(weights.values()) * 0.7 + 0.3)) * 100
+    
+    # 4. 시장 중립화 (Beta Neutralization)
+    # Alpha = Score - (Beta * Market_Factor)
+    # Market_Factor는 시장의 평균적인 과열도라고 가정 (여기선 50점으로 고정하거나 전체 평균 사용)
+    if 'beta' in scored.columns:
+        market_bias = 50 # 기준점
+        # 베타가 1보다 크면 점수를 깎고(고위험), 1보다 작으면 점수를 높여줌(저변동)
+        # 단, 상승장에서는 베타 높은게 좋으므로, 이 로직은 "안정성"을 중시하는 Alpha 로직임.
+        scored['Alpha_Score'] = scored['Raw_Total'] - (scored['beta'] * (scored['Raw_Total'].mean() * 0.2)) 
+        # 설명: 베타가 높을수록 전체 평균점수의 20%만큼 페널티를 부여 (로우 베타 선호)
+        
+        # 최종적으로 Alpha Score 사용
+        scored['Total_Score'] = scored['Alpha_Score']
+    else:
+        scored['Total_Score'] = scored['Raw_Total']
+
     return scored.sort_values(by='Total_Score', ascending=False)
 
 # ==============================================================================
