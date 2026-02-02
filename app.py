@@ -4,6 +4,7 @@ import numpy as np
 import concurrent.futures
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
+import plotly.express as px
 import logging
 import FinanceDataReader as fdr
 import yfinance as yf
@@ -48,6 +49,28 @@ def get_last_complete_month_end():
     first_of_this_month = today.replace(day=1)
     last_month_end = first_of_this_month - timedelta(days=1)
     return last_month_end
+
+def infer_sector_kr(name):
+    name = str(name)
+    if any(x in name for x in ['스팩', '제호', '기업인수']): return '스팩/금융'
+    if any(x in name for x in ['우', '우B']): return '우선주'
+    
+    keywords = {
+        '반도체/IT': ['삼성전자', 'SK하이닉스', '반도체', '테크', '칩', '시스템', '전자', '이노텍', 'DB하이텍', '주성'],
+        '2차전지': ['에코프로', '엘앤에프', 'LG에너지', '삼성SDI', 'SK이노베이션', '포스코퓨처', '엔켐', '금양'],
+        '바이오/제약': ['바이오', '제약', '약품', '생명', '헬스', '셀트리온', '유한양행', '한미', 'HLB', '알테오젠'],
+        '자동차/부품': ['현대차', '기아', '모비스', '타이어', '만도', '오토', '화신'],
+        '인터넷/게임': ['NAVER', '카카오', '게임', '소프트', '엔씨', '펄어비스', '크래프톤', '넷마블'],
+        '엔터/미디어': ['엔터', '스튜디오', '미디어', '에스엠', 'JYP', 'YG', '하이브', 'CJ ENM'],
+        '금융/지주': ['금융', '지주', '은행', '증권', '보험', '카드', '투자', '홀딩스', '메리츠', 'KB', '신한'],
+        '조선/중공업': ['중공업', '조선', '기계', '엔진', '현대미포', '한국조선', '두산', '한화오션', '현대로템'],
+        '화학/정유': ['화학', '케미칼', '정유', 'S-Oil', '롯데정밀', '효성', '금호'],
+        '건설/건자재': ['건설', '개발', '엔지니어링', '시멘트', '페인트', '현대건설'],
+        '소비재/유통': ['푸드', '식품', '제과', '쇼핑', '백화점', '이마트', '호텔', '항공', '화장품', '아모레']
+    }
+    for sector, keys in keywords.items():
+        if any(k in name for k in keys): return sector
+    return '기타/소형주'
 
 # ==============================================================================
 # [데이터 로더]
@@ -371,7 +394,7 @@ with st.sidebar:
     mode = st.radio("모드 선택", ["📊 실시간 랭킹", "⚡ 단타/스윙", "🎰 포트폴리오", "📉 백테스트", "🔍 전략 최적화"])
     st.divider()
     
-PRESETS = {
+    PRESETS = {
         "사용자 정의": (0.5, 0.5, 0.5, 0.5), 
         "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
         "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), 
