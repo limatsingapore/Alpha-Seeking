@@ -146,6 +146,85 @@ def calculate_factors_vectorized(p_sub, v_sub, min_amt, trading_days=252):
     
     return factors.dropna()
 
+# ==============================================================================
+# [NEW] 펀더멘털 & 베타 팩터 계산기 (실시간 분석용)
+# ==============================================================================
+def get_fundamental_factors(ticker, price_series, benchmark_series):
+    """
+    재무제표 데이터와 베타를 계산 (yfinance 전용)
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        
+        # 1. 베타(Beta) & 시장 중립화 계수 계산
+        # 가격 데이터 길이를 맞춤
+        common_idx = price_series.index.intersection(benchmark_series.index)
+        if len(common_idx) < 60: return None
+        
+        p_ret = price_series.loc[common_idx].pct_change().dropna()
+        b_ret = benchmark_series.loc[common_idx].pct_change().dropna()
+        
+        # 공분산 / 분산
+        cov = np.cov(p_ret, b_ret)[0][1]
+        var = np.var(b_ret)
+        beta = cov / var if var != 0 else 1.0
+        
+        # 2. 재무 데이터 가져오기 (비동기 처리 안 하면 느림, 여기선 로직 구현 위주)
+        info = stock.info
+        fin = stock.financials
+        bal = stock.balance_sheet
+        cash = stock.cashflow
+        
+        # 데이터가 없으면 None 반환
+        if fin.empty or bal.empty or cash.empty: return None
+
+        # --- [A] 어닝 모멘텀 (EPS Growth) ---
+        # (EPS TTM - EPS 1년전) / abs(EPS 1년전)
+        # yfinance info에서 trailingEps 제공, 과거 데이터는 financials에서 추정
+        eps_ttm = info.get('trailingEps', None)
+        
+        # 재무제표는 연단위 혹은 분기단위. 여기선 최근 연간 기준 근사치 사용
+        # (정교한 4Q 전 데이터는 쿼터별 데이터가 필수이나 속도상 연간 데이터로 대용)
+        try:
+            eps_prev = fin.loc['Basic EPS'].iloc[1] # 작년 EPS
+        except: 
+            eps_prev = eps_ttm # 데이터 없으면 모멘텀 0 처리
+            
+        if eps_ttm and eps_prev:
+            earn_mom = (eps_ttm - eps_prev) / abs(eps_prev)
+        else:
+            earn_mom = 0.0
+
+        # --- [B] 퀄리티 (Quality) ---
+        # ROE, Gross Margin, Operating Margin
+        roe = info.get('returnOnEquity', 0)
+        gm = info.get('grossMargins', 0)
+        om = info.get('operatingMargins', 0)
+        
+        # --- [C] 회계 정직성 (Accruals) ---
+        # Accrual = (Net Income - Operating Cash Flow) / Total Assets
+        # 발생액이 높으면(현금흐름보다 순이익이 과도하게 높으면) 분식회계/이익조정 의심 -> 낮을수록 좋음
+        try:
+            ni = cash.loc['Net Income'].iloc[0] if 'Net Income' in cash.index else fin.loc['Net Income'].iloc[0]
+            ocf = cash.loc['Operating Cash Flow'].iloc[0] if 'Operating Cash Flow' in cash.index else cash.loc['Total Cash From Operating Activities'].iloc[0]
+            assets = bal.loc['Total Assets'].iloc[0]
+            
+            accrual = (ni - ocf) / assets if assets != 0 else 0
+        except:
+            accrual = 0.0 # 데이터 없으면 중립 처리
+
+        return {
+            'beta': beta,
+            'earn_mom': earn_mom,
+            'roe': roe,
+            'gross_margin': gm,
+            'oper_margin': om,
+            'accrual': accrual
+        }
+        
+    except Exception as e:
+        return None
+
 def rank_and_score(factor_df, weights):
     if factor_df.empty: return factor_df
     scored = factor_df.copy()
