@@ -522,14 +522,276 @@ elif mode == "⚡ 단타/스윙 스캐너":
             )
         else: st.warning("데이터가 없습니다.")
 
-# 3. 섹터 히트맵
+# ==============================================================================
+# [Helper] 한국 종목 섹터 추론기 (강화판)
+# ==============================================================================
+def infer_sector_kr(name):
+    """종목명 키워드로 섹터를 역추적"""
+    name = str(name)
+    if any(x in name for x in ['스팩', '제호', '기업인수']): return '스팩/금융'
+    if any(x in name for x in ['우', '우B']): return '우선주'
+    
+    # 주요 섹터 키워드 매핑
+    keywords = {
+        '반도체/IT': ['삼성전자', 'SK하이닉스', '반도체', '테크', '칩', '시스템', '전자', '디스플레이', '이노텍', 'DB하이텍', '주성', '한미반도체'],
+        '2차전지': ['에코프로', '엘앤에프', 'LG에너지', '삼성SDI', 'SK이노베이션', '포스코퓨처', '천보', '엔켐', '금양'],
+        '바이오/제약': ['바이오', '제약', '약품', '생명', '헬스', '셀트리온', '유한양행', '한미약품', 'HLB', '알테오젠', '케어'],
+        '자동차/부품': ['현대차', '기아', '모비스', '타이어', '만도', '오토', '화신', '성우하이텍'],
+        '인터넷/게임': ['NAVER', '카카오', '게임', '소프트', '엔씨', '펄어비스', '크래프톤', '위메이드', '넷마블'],
+        '엔터/미디어': ['엔터', '스튜디오', '미디어', '에스엠', 'JYP', 'YG', '하이브', 'CJ ENM', '아프리카'],
+        '금융/지주': ['금융', '지주', '은행', '증권', '보험', '카드', '투자', '홀딩스', '메리츠', 'KB', '신한'],
+        '조선/중공업': ['중공업', '조선', '기계', '엔진', '현대미포', '한국조선', '삼성중공업', '두산', '한화오션'],
+        '화학/정유': ['화학', '케미칼', '정유', 'S-Oil', '롯데정밀', '효성', '금호'],
+        '건설/건자재': ['건설', '개발', '엔지니어링', '시멘트', '페인트', '현대건설', 'GS건설'],
+        '소비재/유통': ['푸드', '식품', '제과', '쇼핑', '백화점', '이마트', '호텔', '투어', '항공', '화장품', '아모레']
+    }
+    
+    for sector, keys in keywords.items():
+        if any(k in name for k in keys):
+            return sector
+            
+    return '기타/소형주'
+
+# ==============================================================================
+# [MODE 3] 섹터 히트맵 (탭 구성 적용)
+# ==============================================================================
 elif mode == "🔄 섹터 히트맵":
-    st.subheader("🔄 실시간 섹터 자금 흐름")
-    if not SECTOR_INFO: st.error("섹터 정보가 없습니다.")
-    else:
-        sector_counts = pd.Series(SECTOR_INFO.values()).value_counts()
-        fig = px.treemap(names=sector_counts.index, parents=["Market"]*len(sector_counts), values=sector_counts.values, title=f"{market} 섹터 비중")
-        st.plotly_chart(fig, use_container_width=True)
+    st.subheader("🔄 시장 자금 흐름 분석 (Sector Flow)")
+    
+    # 탭 구성
+    tab1, tab2, tab3 = st.tabs(["📊 실시간 강도", "🔥 급등 테마 탐지", "📈 섹터 로테이션"])
+    
+    # --------------------------------------------------------------------------
+    # TAB 1: 실시간 섹터 강도 (전체 종목 스캔)
+    # --------------------------------------------------------------------------
+    with tab1:
+        st.caption("오늘 시장에서 가장 강한 업종을 찾습니다.")
+        period_select = st.selectbox("기간 선택", ["오늘(1D)", "1주일(1W)", "1개월(1M)", "3개월(3Q)"])
+        period_map = {"오늘(1D)": 2, "1주일(1W)": 5, "1개월(1M)": 20, "3개월(3Q)": 60} 
+        # 오늘 수익률 계산을 위해 최소 2일치 데이터 필요
+        
+        if st.button("섹터 강도 분석 실행", type="primary"):
+            lookback = period_map[period_select]
+            targets = ALL_STOCKS[:400] # 상위 400개 샘플링
+            sector_returns = {} # {섹터명: [수익률 리스트]}
+            
+            bar = st.progress(0, "시장 데이터 스캔 중...")
+            
+            # 병렬 처리로 데이터 수집
+            def get_ret(t):
+                try:
+                    if COUNTRY == "KR":
+                        # 넉넉하게 가져옴
+                        df = fdr.DataReader(t, (datetime.now()-timedelta(days=lookback*2+10)).strftime('%Y-%m-%d'))
+                    else:
+                        df = yf.Ticker(t).history(period="6mo")
+                        
+                    if len(df) < lookback: return None
+                    
+                    # 수익률 계산
+                    ret = (df['Close'].iloc[-1] / df['Close'].iloc[-lookback]) - 1
+                    
+                    # 섹터 분류
+                    name = TICKER_INFO.get(t, t)
+                    if COUNTRY == "KR":
+                        sec = infer_sector_kr(name)
+                    else:
+                        sec = SECTOR_INFO.get(t, 'Unknown')
+                        
+                    return sec, ret
+                except: return None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+                futures = [ex.submit(get_ret, t) for t in targets]
+                for i, fut in enumerate(concurrent.futures.as_completed(futures)):
+                    res = fut.result()
+                    if res:
+                        s, r = res
+                        if s not in sector_returns: sector_returns[s] = []
+                        sector_returns[s].append(r)
+                    bar.progress((i+1)/len(targets))
+            bar.empty()
+            
+            # 결과 집계
+            if sector_returns:
+                # 평균 수익률 및 종목 수
+                stats = []
+                for s, rets in sector_returns.items():
+                    if len(rets) >= 3: # 최소 3종목 이상인 섹터만
+                        stats.append({
+                            '섹터': s,
+                            '수익률': np.mean(rets),
+                            '종목수': len(rets)
+                        })
+                
+                df_sec = pd.DataFrame(stats).sort_values('수익률', ascending=False)
+                
+                # 1. 바 차트
+                fig = px.bar(
+                    df_sec, x='섹터', y='수익률', color='수익률',
+                    color_continuous_scale='RdYlGn',
+                    title=f"📊 {period_select} 섹터별 평균 수익률"
+                )
+                fig.update_layout(xaxis_tickangle=-45)
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # 2. 강세/약세 리스트
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.subheader("🔥 강세 섹터 Top 5")
+                    st.dataframe(
+                        df_sec.head(5).style.format({'수익률': '{:.2%}'}),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                with c2:
+                    st.subheader("❄️ 약세 섹터 Top 5")
+                    st.dataframe(
+                        df_sec.tail(5).sort_values('수익률').style.format({'수익률': '{:.2%}'}),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+            else:
+                st.warning("데이터가 부족합니다.")
+
+    # --------------------------------------------------------------------------
+    # TAB 2: 급등 테마 탐지 (거래량 급증 기반)
+    # --------------------------------------------------------------------------
+    with tab2:
+        st.caption("거래량이 폭발하며 급등하는 '주도 테마'를 찾습니다.")
+        
+        if st.button("🚀 급등 테마 스캔", type="primary"):
+            targets = ALL_STOCKS[:500]
+            hot_stocks = []
+            bar = st.progress(0, "거래량 분석 중...")
+            
+            def scan_hot(t):
+                try:
+                    if COUNTRY == "KR": df = fdr.DataReader(t, (datetime.now()-timedelta(days=20)).strftime('%Y-%m-%d'))
+                    else: df = yf.Ticker(t).history(period="1mo")
+                    
+                    if len(df) < 10: return None
+                    
+                    # 조건: 1일 등락률 > 3% AND 거래량 > 5일 평균의 2배
+                    ret = df['Close'].pct_change().iloc[-1]
+                    vol_ratio = df['Volume'].iloc[-1] / df['Volume'].iloc[-6:-1].mean()
+                    
+                    if ret > 0.03 and vol_ratio >= 2.0:
+                        name = TICKER_INFO.get(t, t)
+                        sec = infer_sector_kr(name) if COUNTRY=="KR" else SECTOR_INFO.get(t, 'Unknown')
+                        return {'종목명': name, '섹터': sec, '등락률': ret, '거래량급증': vol_ratio}
+                except: return None
+                
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+                futures = [ex.submit(scan_hot, t) for t in targets]
+                for i, fut in enumerate(concurrent.futures.as_completed(futures)):
+                    res = fut.result()
+                    if res: hot_stocks.append(res)
+                    bar.progress((i+1)/len(targets))
+            bar.empty()
+            
+            if hot_stocks:
+                df_hot = pd.DataFrame(hot_stocks)
+                
+                # 섹터별로 묶어서 카운트
+                hot_sectors = df_hot['섹터'].value_counts()
+                
+                # 1. 핫 섹터 랭킹
+                st.subheader(f"🔥 오늘의 주도 테마: **{hot_sectors.index[0]}**")
+                
+                # 트리맵 시각화
+                fig = px.treemap(
+                    df_hot, path=['섹터', '종목명'], values='거래량급증',
+                    color='등락률', color_continuous_scale='OrRd',
+                    title="급등주 섹터 분포 (크기=거래강도)"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # 2. 상세 리스트
+                st.dataframe(
+                    df_hot.sort_values('거래량급증', ascending=False),
+                    use_container_width=True,
+                    column_config={
+                        "등락률": st.column_config.NumberColumn(format="%.2%"),
+                        "거래량급증": st.column_config.NumberColumn(format="%.1fx")
+                    }
+                )
+            else:
+                st.info("오늘 급등 조건(3%↑ + 거래량2배)을 만족하는 종목이 없습니다.")
+
+    # --------------------------------------------------------------------------
+    # TAB 3: 섹터 로테이션 (과거 1년 흐름)
+    # --------------------------------------------------------------------------
+    with tab3:
+        st.caption("지난 12개월간 돈이 어떻게 돌았는지(Rotation) 보여줍니다.")
+        
+        if st.button("🔄 로테이션 분석 실행"):
+            with st.spinner("과거 데이터 로딩 중..."):
+                # 대표 섹터 ETF 또는 대표주 사용
+                # KR: 주요 업종 대표주 2개씩
+                # US: Sector ETF (XLK, XLV 등)
+                
+                if COUNTRY == "KR":
+                    sectors = {
+                        '반도체': ['000660', '005930'], # 하이닉스, 삼전
+                        '2차전지': ['373220', '006400'], # LG엔솔, SDI
+                        '바이오': ['207940', '068270'], # 삼바, 셀트
+                        '자동차': ['005380', '000270'], # 현대, 기아
+                        '금융': ['105560', '055550'],   # KB, 신한
+                        '인터넷': ['035420', '035720']  # 네이버, 카카오
+                    }
+                else:
+                    sectors = {
+                        '기술(Tech)': ['XLK'], '헬스케어': ['XLV'], '금융': ['XLF'],
+                        '에너지': ['XLE'], '소비재': ['XLY'], '산업재': ['XLI']
+                    }
+                
+                # 월별 수익률 데이터 생성
+                monthly_data = {}
+                end_d = datetime.now()
+                dates = [end_d - timedelta(days=30*i) for i in range(12)][::-1] # 최근 12개월
+                date_labels = [d.strftime('%y-%m') for d in dates]
+                
+                for sec_name, codes in sectors.items():
+                    sec_monthly_rets = []
+                    
+                    # 각 월별 수익률 계산 (약식)
+                    # 실제로는 전체 데이터를 한번에 받아서 resample하는게 빠름
+                    # 여기서는 로직 단순화를 위해 대표 종목의 최근 1년치 데이터를 받음
+                    try:
+                        code = codes[0]
+                        if COUNTRY == "KR": 
+                            df = fdr.DataReader(code, (end_d - timedelta(days=380)).strftime('%Y-%m-%d'))
+                        else: 
+                            df = yf.Ticker(code).history(period="1y")
+                        
+                        # 월간 리샘플링
+                        df_m = df['Close'].resample('M').last().pct_change()
+                        # 최근 12개만
+                        sec_monthly_rets = df_m.tail(12).values.tolist()
+                    except:
+                        sec_monthly_rets = [0]*12
+                        
+                    # 길이 맞추기
+                    if len(sec_monthly_rets) < 12:
+                        sec_monthly_rets = [0]*(12-len(sec_monthly_rets)) + sec_monthly_rets
+                        
+                    monthly_data[sec_name] = sec_monthly_rets
+                
+                # 히트맵 그리기
+                df_rot = pd.DataFrame(monthly_data, index=date_labels).T
+                
+                fig = px.imshow(
+                    df_rot,
+                    labels=dict(x="월", y="섹터", color="수익률"),
+                    color_continuous_scale='RdYlGn',
+                    aspect="auto",
+                    title="📅 월간 섹터 수익률 히트맵"
+                )
+                fig.update_traces(text=df_rot.applymap(lambda x: f"{x:.1%}").values, texttemplate="%{text}")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.info("💡 붉은색(하락)에서 초록색(상승)으로 변하는 섹터가 다음 주도주일 가능성이 높습니다.")
 
 # 4. 포트폴리오 진단
 elif mode == "🎰 포트폴리오 진단":
