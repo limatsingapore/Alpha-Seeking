@@ -14,7 +14,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Perfect)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Strategy Finder)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -37,7 +37,6 @@ CONST = {
     'COST_RATE': 0.002,        
     'TOP_N': 20,               
     'MIN_AMT': 5_000_000_000,
-    # 기본 시작일
     'DEFAULT_START_DATE': datetime(2015, 1, 1)
 }
 
@@ -45,7 +44,6 @@ CONST = {
 # [Helper: 날짜 계산]
 # ==============================================================================
 def get_last_complete_month_end():
-    """지난달의 마지막 날짜 반환 (예: 오늘이 5월 15일 -> 4월 30일 반환)"""
     today = datetime.now()
     first_of_this_month = today.replace(day=1)
     last_month_end = first_of_this_month - timedelta(days=1)
@@ -151,7 +149,7 @@ def load_us_data(index_name='S&P 500'):
         return {"AAPL":"Apple"}, ["AAPL"]
 
 # ==============================================================================
-# [백테스트 데이터 페처 - 기간 선택 적용]
+# [백테스트 데이터 페처]
 # ==============================================================================
 @st.cache_data(ttl=3600*24)
 def fetch_data_kr(universe, start_date, end_date):
@@ -215,27 +213,25 @@ def fetch_data_us(universe, start_date, end_date):
     except: return pd.DataFrame(), pd.DataFrame(), bm
 
 # ==============================================================================
-# [★ 핵심 백테스트 엔진 (Realistic)]
+# [핵심 백테스트 엔진]
 # ==============================================================================
 def run_backtest(prices, volumes, benchmark, weights, ticker_map):
     if prices.empty: return pd.DataFrame()
 
-    # [수정] 매월 첫 거래일(Month Start) 기준 리밸런싱
+    # 매월 첫 거래일(Month Start) 기준 리밸런싱
     reb_dates = prices.groupby(pd.Grouper(freq='MS')).apply(lambda x: x.index[0])
     
     logs = []
     start_idx = 12 
     
     for i in range(start_idx, len(reb_dates)-1):
-        rebal_date = reb_dates[i]       # 리밸런싱 실행일 (매수일)
-        next_rebal = reb_dates[i+1]     # 다음 리밸런싱일
+        rebal_date = reb_dates[i]       
+        next_rebal = reb_dates[i+1]     
         
-        # 1. 팩터 계산: 리밸런싱 전일(D-1) 기준 데이터 사용
-        # (현실성: 장 시작 전에 전날 종가 기준으로 종목을 뽑아옴)
         try:
             loc = prices.index.get_loc(rebal_date)
             if loc == 0: continue
-            signal_date = prices.index[loc - 1] # 전 거래일
+            signal_date = prices.index[loc - 1] 
         except: continue
         
         p_sub = prices.loc[:signal_date].tail(300)
@@ -251,22 +247,16 @@ def run_backtest(prices, volumes, benchmark, weights, ticker_map):
                 
         if not daily_factors: continue
         
-        # 2. 종목 선정
         factor_df = pd.DataFrame(daily_factors).set_index('code')
         ranked = rank_and_score(factor_df, weights)
         picks = ranked.head(CONST['TOP_N']).index.tolist()
         
         if not picks: continue
 
-        # 3. 수익률 계산: 리밸런싱일(당일) 종가 매수 ~ 다음 리밸런싱일 전날 종가
-        # (실제 보유 기간)
         try:
-            # 매수일 종가 ~ 다음 매수일 종가
             period_price = prices.loc[rebal_date:next_rebal, picks]
             if period_price.empty: continue
-            
             period_daily_rets = period_price.pct_change().dropna()
-            
         except KeyError: continue
 
         if not period_daily_rets.empty:
@@ -283,16 +273,79 @@ def run_backtest(prices, volumes, benchmark, weights, ticker_map):
                 'Date': next_rebal,
                 'Port_Ret': net_ret,
                 'BM_Ret': bm_ret,
-                'Top1_Holding': TICKER_INFO.get(picks[0], picks[0]) if picks else "",
-                'Holdings_Full': ", ".join([TICKER_INFO.get(x,x) for x in picks])
+                'Top1_Holding': ticker_map.get(picks[0], picks[0]) if picks else "",
+                'Holdings_Full': ", ".join([ticker_map.get(x,x) for x in picks])
             })
             
     return pd.DataFrame(logs)
 
 # ==============================================================================
+# [전략 최적화 엔진]
+# ==============================================================================
+def optimize_strategy(prices, volumes, benchmark, ticker_map, target_metric='win_rate', presets={}):
+    results = []
+    
+    progress_bar = st.progress(0)
+    total_presets = len(presets)
+    
+    for i, (name, (mom, liq, vol, risk)) in enumerate(presets.items()):
+        weights = {'mom': mom, 'liq': liq, 'vol': vol, 'risk': risk}
+        
+        # 백테스트 실행
+        res = run_backtest(prices, volumes, benchmark, weights, ticker_map)
+        
+        if not res.empty:
+            res = res.set_index('Date')
+            res['Cum_Port'] = (1 + res['Port_Ret']).cumprod()
+            
+            # 성과 지표 계산
+            tot = res['Cum_Port'].iloc[-1] - 1
+            y = len(res)/12
+            cagr = (tot+1)**(1/y)-1 if y>0 else 0
+            mdd = (res['Cum_Port']/res['Cum_Port'].cummax()-1).min()
+            ann_vol = res['Port_Ret'].std() * np.sqrt(12)
+            sharpe = cagr / ann_vol if ann_vol > 0 else 0
+            win_rate = (res['Port_Ret']>0).sum()/len(res)
+            
+            results.append({
+                'Strategy': name,
+                'Win_Rate': win_rate,
+                'CAGR': cagr,
+                'Total_Return': tot,
+                'MDD': mdd,
+                'Sharpe': sharpe,
+                'Volatility': ann_vol,
+                'Weights': f"추세{mom}|수급{liq}|저변동{vol}|방어{risk}"
+            })
+        
+        # 진행률 업데이트
+        progress_bar.progress((i + 1) / total_presets)
+    
+    progress_bar.empty()
+    
+    if not results: return pd.DataFrame()
+    
+    df = pd.DataFrame(results)
+    
+    # 목표 지표에 따라 정렬
+    sort_map = {
+        'win_rate': ('Win_Rate', False),
+        'sharpe': ('Sharpe', False),
+        'cagr': ('CAGR', False),
+        'mdd': ('MDD', True)  # MDD는 높을수록(0에 가까울수록) 좋음 (음수이므로 내림차순 정렬 시 0에 가까운게 위로 옴? 아니오, 오름차순이어야 -50%보다 -10%가 뒤로 감. -> 내림차순: -10% > -50%)
+        # MDD는 보통 절대값으로 보지만 여기선 음수(-0.2)로 표현됨.
+        # -0.1(좋음) > -0.5(나쁨). 따라서 내림차순(False) 정렬이 맞음. 
+        # 단, MDD 최소화가 목표라면 내림차순(False) -> -0.1이 위로 옴.
+    }
+    
+    col, asc = sort_map.get(target_metric, ('Win_Rate', False))
+    return df.sort_values(by=col, ascending=asc)
+
+
+# ==============================================================================
 # [메인 컨트롤러]
 # ==============================================================================
-st.title("🌍 Alpha Seeking Pro (Perfect)")
+st.title("🌍 Alpha Seeking Pro (Strategy Finder)")
 
 # --- 1. 사이드바 ---
 with st.sidebar:
@@ -330,6 +383,7 @@ with st.sidebar:
     st.divider()
     st.header("⚙️ 전략 설정")
     
+    # [통합된 프리셋 정의]
     PRESETS = {
         "사용자 정의": (0.5, 0.5, 0.5, 0.5),
         "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
@@ -341,10 +395,16 @@ with st.sidebar:
         "⚖️ 황금 밸런스": (0.5, 0.5, 0.5, 0.5),
         "💎 우상향 정석": (0.7, 0.3, 0.7, 0.4),
         "🐆 안전한 사냥": (0.8, 0.7, 0.1, 0.8),
-        "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8)
+        "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8),
+        # [NEW Presets]
+        "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1),
+        "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9),
+        "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6),
+        "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2),
+        "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7)
     }
     
-    sel_preset = st.selectbox("프리셋", list(PRESETS.keys()), index=9)
+    sel_preset = st.selectbox("프리셋 (실시간/백테스트용)", list(PRESETS.keys()), index=9)
     dw = PRESETS[sel_preset]
     w_mom = st.slider("📈 추세", 0.0, 1.0, dw[0], 0.1)
     w_liq = st.slider("🌊 수급", 0.0, 1.0, dw[1], 0.1)
@@ -353,7 +413,8 @@ with st.sidebar:
     weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
     
     st.divider()
-    mode = st.radio("모드", ["📊 실시간 분석", "📉 백테스트"])
+    # [NEW Mode]
+    mode = st.radio("모드", ["📊 실시간 분석", "📉 백테스트", "🔍 전략 최적화"])
 
 # --- VIX Helper ---
 def get_vix_val(ticker):
@@ -428,13 +489,11 @@ if mode == "📊 실시간 분석":
         else:
             st.warning("결과 없음")
 
-else:
-    # [NEW] 기간 설정 UI
+elif mode == "📉 백테스트":
     c1, c2 = st.columns(2)
     with c1:
         start_date = st.date_input("시작일", CONST['DEFAULT_START_DATE'])
     with c2:
-        # 종료일 기본값: 지난달 말일
         default_end = get_last_complete_month_end()
         end_date = st.date_input("종료일 (최근 완료된 월 권장)", default_end)
 
@@ -448,7 +507,6 @@ else:
             with st.spinner("시뮬레이션 중..."):
                 u = ALL_STOCKS[:400] if len(ALL_STOCKS) > 400 else ALL_STOCKS
                 
-                # Fetch Data with User Range
                 if COUNTRY == "KR": p, v, bm = fetch_data_kr(u, start_date, end_date)
                 else: p, v, bm = fetch_data_us(u, start_date, end_date)
                     
@@ -495,4 +553,119 @@ else:
                         st.divider()
                         st.dataframe(res[['Port_Ret', 'Holdings_Full', 'BM_Ret']].tail(5), use_container_width=True)
                     else: st.error("백테스트 결과가 없습니다.")
+                else: st.error("데이터 로딩 실패")
+
+else: # [NEW] 🔍 전략 최적화
+    st.subheader("🔍 전략 최적화 (모든 프리셋 비교)")
+    
+    c1, c2 = st.columns(2)
+    with c1:
+        start_date = st.date_input("시작일", CONST['DEFAULT_START_DATE'], key='opt_start')
+    with c2:
+        default_end = get_last_complete_month_end()
+        end_date = st.date_input("종료일", default_end, key='opt_end')
+    
+    target = st.selectbox(
+        "최적화 목표",
+        ["승률 (Win Rate)", "샤프 비율 (Sharpe)", "연복리 수익률 (CAGR)", "최소 MDD"],
+        index=0
+    )
+    
+    target_map = {
+        "승률 (Win Rate)": "win_rate",
+        "샤프 비율 (Sharpe)": "sharpe",
+        "연복리 수익률 (CAGR)": "cagr",
+        "최소 MDD": "mdd"
+    }
+    
+    if st.button("🚀 최적화 실행", type="primary"):
+        if start_date >= end_date:
+            st.error("시작일은 종료일보다 빨라야 합니다.")
+        else:
+            with st.spinner("15가지 전략 전체 시뮬레이션 중... ⏳"):
+                u = ALL_STOCKS[:400] if len(ALL_STOCKS) > 400 else ALL_STOCKS
+                
+                if COUNTRY == "KR": p, v, bm = fetch_data_kr(u, start_date, end_date)
+                else: p, v, bm = fetch_data_us(u, start_date, end_date)
+                
+                if not p.empty:
+                    # 사용자 정의는 제외하고, 프리셋 15개만 테스트
+                    test_presets = {k:v for k,v in PRESETS.items() if k != "사용자 정의"}
+                    
+                    opt_results = optimize_strategy(p, v, bm, TICKER_INFO, target_map[target], test_presets)
+                    
+                    if not opt_results.empty:
+                        best_st = opt_results.iloc[0]
+                        st.success(f"✅ 최적 전략: **{best_st['Strategy']}** (CAGR: {best_st['CAGR']:.1%}, Sharpe: {best_st['Sharpe']:.2f})")
+                        
+                        # 결과 테이블
+                        st.dataframe(
+                            opt_results.style.format({
+                                'Win_Rate': '{:.1%}',
+                                'CAGR': '{:.1%}',
+                                'Total_Return': '{:.1%}',
+                                'MDD': '{:.1%}',
+                                'Sharpe': '{:.2f}',
+                                'Volatility': '{:.1%}'
+                            }).background_gradient(subset=['Win_Rate', 'CAGR', 'Sharpe'], cmap='RdYlGn'),
+                            use_container_width=True
+                        )
+                        
+                        # 상위 3개 전략 비교 차트
+                        st.divider()
+                        st.subheader("📊 상위 3개 전략 vs 벤치마크 비교")
+                        
+                        fig = go.Figure()
+                        
+                        # 벤치마크 먼저 그리기
+                        if not bm.empty:
+                            # 기간 슬라이싱 및 정규화
+                            try:
+                                bm_period = bm.loc[start_date:end_date]
+                                if not bm_period.empty:
+                                    bm_reindexed = bm_period / bm_period.iloc[0]
+                                    fig.add_trace(go.Scatter(
+                                        x=bm_reindexed.index,
+                                        y=bm_reindexed.values,
+                                        name=f"{BM_NAME} (Benchmark)",
+                                        line=dict(dash='dot', color='gray', width=1)
+                                    ))
+                            except: pass
+
+                        # 상위 3개 그리기
+                        colors = ['#ef4444', '#3b82f6', '#10b981'] # Red, Blue, Green
+                        for idx, row in opt_results.head(3).iterrows():
+                            strategy_name = row['Strategy']
+                            weights_str = row['Weights']
+                            
+                            # 가중치 파싱
+                            parts = weights_str.split('|')
+                            w_dict = {}
+                            for part in parts:
+                                if '추세' in part: w_dict['mom'] = float(part.replace('추세', ''))
+                                elif '수급' in part: w_dict['liq'] = float(part.replace('수급', ''))
+                                elif '저변동' in part: w_dict['vol'] = float(part.replace('저변동', ''))
+                                elif '방어' in part: w_dict['risk'] = float(part.replace('방어', ''))
+                            
+                            res = run_backtest(p, v, bm, w_dict, TICKER_INFO)
+                            if not res.empty:
+                                res = res.set_index('Date')
+                                res['Cum_Port'] = (1 + res['Port_Ret']).cumprod()
+                                
+                                fig.add_trace(go.Scatter(
+                                    x=res.index,
+                                    y=res['Cum_Port'],
+                                    name=strategy_name,
+                                    line=dict(width=2)
+                                ))
+                        
+                        fig.update_layout(
+                            xaxis_title="날짜",
+                            yaxis_title="누적 수익 (1.0 = 원금)",
+                            hovermode='x unified',
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                    else: st.error("최적화 결과가 없습니다.")
                 else: st.error("데이터 로딩 실패")
