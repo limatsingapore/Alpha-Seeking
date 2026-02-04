@@ -6,13 +6,12 @@ import plotly.graph_objects as go
 import logging
 import FinanceDataReader as fdr
 import time
-# Scipy 제거 (Numpy로 대체)
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v7.5)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v7.8)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -36,7 +35,7 @@ CONST = {
     'DEFAULT_START_DATE': datetime(2018, 1, 1),
     'RISK_FREE_RATE': 0.035,
     'COST_RATE': 0.002, 
-    'MIN_AMT': 5_000_000_000,
+    'MIN_AMT': 5_000_000_000, # [복원] 최소 거래대금 50억 (절대 하한선)
     'TOP_N': 20
 }
 
@@ -59,9 +58,7 @@ def calculate_slippage(amount_traded, avg_daily_volume):
     else: return 0.01 
 
 def get_optimal_holdings(portfolio_size):
-    if portfolio_size < 50_000_000: return 10
-    elif portfolio_size < 300_000_000: return 20
-    else: return 30
+    return CONST['TOP_N'] # 20개 고정
 
 def infer_sector_kr(name, code=None):
     exact_mapping = {
@@ -105,6 +102,8 @@ def load_kr_data():
         if df.empty: raise ValueError("KRX Empty")
         if 'Symbol' in df.columns: df.rename(columns={'Symbol':'Code'}, inplace=True)
         df = df[~df['Name'].str.contains('스팩|우B|우|리츠|홀딩스', na=False)]
+        
+        # 유동성 상위 300개 확보 (검증 풀)
         if 'Amount' in df.columns:
             df = df.sort_values('Amount', ascending=False).head(300) 
         elif 'Marcap' in df.columns:
@@ -135,6 +134,7 @@ def fetch_data_serial(universe, start_date, end_date):
     for i, code in enumerate(universe):
         try:
             d = fdr.DataReader(code, s_str, e_str)
+            # [복원] 최소 120일(약 6개월) 이상 데이터 존재해야 함 (신규 상장주 제외)
             if len(d) > 120 and d['Close'].iloc[-1] > 0:
                 if 'Close' in d.columns: p_dict[code] = d['Close']
                 if 'Volume' in d.columns: v_dict[code] = d['Volume']
@@ -158,14 +158,17 @@ def fetch_data_serial(universe, start_date, end_date):
     return df_p, df_v, bm_dict
 
 # ==============================================================================
-# [Core Logic]
+# [Core Logic: 팩터 계산]
 # ==============================================================================
 def calculate_factors(price, volume, min_amt, trading_days=252):
+    # [복원] 팩터 계산 시에도 120일 데이터 확인
     if len(price) < 120 or price.iloc[-1] == 0 or np.isnan(price.iloc[-1]): return None
     try:
         p = price
         v = volume
         amt = p * v
+        
+        # 거래대금 필터 (Backtest Loop에서 전달받은 동적 기준 적용)
         if amt.iloc[-20:].mean() < min_amt: return None
         
         mom_short = p.pct_change(20).iloc[-1]
@@ -217,6 +220,9 @@ def rank_and_score(factor_df, weights, ticker_map=None):
     
     return scored.sort_values(by='Total_Score', ascending=False)
 
+# ==============================================================================
+# [백테스트 엔진]
+# ==============================================================================
 def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, initial_capital=100_000_000):
     if prices.empty: return pd.DataFrame()
     
@@ -224,7 +230,7 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
     logs = []
     prev_picks = [] 
     
-    target_n = get_optimal_holdings(initial_capital)
+    target_n = CONST['TOP_N'] # 20개
     current_capital = initial_capital
     
     if benchmark is None or benchmark.empty:
@@ -238,10 +244,18 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
         if i < len(reb_dates) - 1: next_rebal = reb_dates[i+1]
         else: next_rebal = prices.index[-1]
         
-        if rebal_date >= next_rebal: break
+        # 마지막 날짜 포함
+        if rebal_date > prices.index[-1]: break
             
         try:
-            min_trade_amt = (current_capital / target_n) * 50
+            # [수정] 거래대금 필터 강화 (절충안 적용)
+            # 1. 자본금 대비 30배 (슬리피지 방지)
+            # 2. 절대금액 50억 (잡주 방지)
+            # 둘 중 큰 값을 기준으로 함
+            min_trade_amt = max(
+                (current_capital / target_n) * 30, 
+                CONST['MIN_AMT']
+            )
             
             rebal_idx = prices.index.searchsorted(rebal_date)
             if rebal_idx <= 0: continue
@@ -257,7 +271,7 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
                 if f:
                     f['code'] = t; daily_factors.append(f)
             
-            if len(daily_factors) < target_n: continue 
+            if not daily_factors: continue 
             
             factor_df = pd.DataFrame(daily_factors).set_index('code')
             ranked = rank_and_score(factor_df, weights, ticker_map=ticker_map)
@@ -289,7 +303,7 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
                 kept = set(prev_picks) & set(picks)
                 turnover = (denom - len(kept)) / denom
             
-            target_amt_per_stock = current_capital / target_n
+            target_amt_per_stock = current_capital / len(picks) if picks else 0
             
             s_costs = []
             for t in picks:
@@ -392,9 +406,8 @@ def optimize_strategy(prices, volumes, ticker_map, presets, const, initial_capit
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v7.5)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v7.8)")
 
-# 프리셋 정의 (사이드바 밖에서 먼저 선언)
 PRESETS = {
     "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
     "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🌊 세력주 포착": (0.4, 1.0, 0.2, 0.2),
@@ -406,7 +419,6 @@ PRESETS = {
     "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2), "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7)
 }
 
-# 콜백 함수 (프리셋 변경 시 슬라이더 값 강제 업데이트)
 def update_sliders():
     ps = st.session_state['preset_select']
     if ps in PRESETS:
@@ -417,7 +429,7 @@ def update_sliders():
         st.session_state['slider_risk'] = vals[3]
 
 with st.sidebar:
-    st.info("대상: KOSPI/KOSDAQ 유동성 상위 200개")
+    st.info("대상: KOSPI/KOSDAQ 유동성 상위 300개")
     initial_cap = st.number_input("투자 원금 (원)", value=100_000_000, step=10_000_000, format="%d")
     TICKER_INFO, ALL_STOCKS = load_kr_data()
             
@@ -427,19 +439,19 @@ with st.sidebar:
     mode = st.radio("모드 선택", ["📉 백테스트", "🔍 전략 최적화"], key="mode_radio")
     st.divider()
     
-    # Selectbox에 콜백 연결
     sel_preset = st.selectbox(
         "전략 프리셋", 
         list(PRESETS.keys()), 
-        index=9, # '🐆 안전한 사냥'을 기본값으로
+        index=7, # '황금 밸런스'를 기본값으로
         key="preset_select",
-        on_change=update_sliders # 핵심 수정
+        on_change=update_sliders 
     )
     
-    # 슬라이더 초기값 세팅 (첫 실행 시 Safe Hunting 값으로)
+    # [수정] 세션 상태 초기화 (현재 선택된 프리셋 값으로)
     if 'slider_mom' not in st.session_state:
-        # 안전한 사냥: (0.8, 0.7, 0.1, 0.8)
-        init_vals = PRESETS["🐆 안전한 사냥"]
+        # sel_preset(키)가 아직 session_state에 없을 수 있으므로 기본값 처리
+        default_preset = st.session_state.get('preset_select', "⚖️ 황금 밸런스")
+        init_vals = PRESETS[default_preset]
         st.session_state['slider_mom'] = init_vals[0]
         st.session_state['slider_liq'] = init_vals[1]
         st.session_state['slider_vol'] = init_vals[2]
@@ -458,6 +470,8 @@ if mode == "📉 백테스트":
     
     if st.button("실행", type="primary", key="btn_run_backtest"):
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
+        
+        st.success(f"데이터 수집 완료: 총 {len(p.columns)}개 종목 (기간: {p.index.min().date()} ~ {p.index.max().date()})")
         
         if not p.empty:
             main_bm = bms.get('KOSPI')
@@ -490,12 +504,6 @@ if mode == "📉 백테스트":
                     
                 st.plotly_chart(fig, use_container_width=True)
                 
-                if 'Capital' in res_chart.columns:
-                    fig_cap = go.Figure()
-                    fig_cap.add_trace(go.Scatter(x=res_chart.index, y=res_chart['Capital'], name='Total Capital', line=dict(color='green')))
-                    fig_cap.update_layout(title="💰 자산 증식 추이 (Compounding Effect)", yaxis_title="원 (KRW)")
-                    st.plotly_chart(fig_cap, use_container_width=True)
-                
                 st.divider()
                 st.subheader("📅 월별 포트폴리오 상세 분석")
                 
@@ -526,7 +534,8 @@ if mode == "📉 백테스트":
                     st.caption(f"※ 선정 기준일(T-1)의 데이터로 분석하여 {sel_date_str} 당일(T) 종가에 매수한 내역입니다.")
 
             else:
-                st.error("백테스트 결과가 없습니다. (기간 내 데이터 부족)")
+                st.error("백테스트 결과가 없습니다.")
+                st.warning("팁: 유동성 필터(최소 거래대금) 조건이 너무 엄격할 수 있습니다.")
         else:
             st.error("데이터 수집 실패")
 
