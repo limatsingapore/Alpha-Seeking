@@ -12,7 +12,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v5.3)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v5.4)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -35,12 +35,15 @@ CONST = {
     'COST_RATE': 0.002,        
     'TOP_N': 20,               
     'MIN_AMT': 5_000_000_000,
-    'DEFAULT_START_DATE': datetime(2018, 1, 1) # 시작일 조정 (데이터 안정성)
+    'DEFAULT_START_DATE': datetime(2018, 1, 1)
 }
 
 # ==============================================================================
 # [Helper Functions]
 # ==============================================================================
+def get_last_complete_month_end():
+    return datetime.now() 
+
 def z_score(x):
     if x.std() == 0: return x * 0
     return (x - x.mean()) / x.std()
@@ -68,7 +71,7 @@ def infer_sector_kr(name):
     return '기타/소형주'
 
 # ==============================================================================
-# [데이터 로더 - 종목 리스트]
+# [데이터 로더]
 # ==============================================================================
 @st.cache_data(ttl=3600*12)
 def load_kr_data():
@@ -78,7 +81,7 @@ def load_kr_data():
         if 'Symbol' in df.columns: df.rename(columns={'Symbol':'Code'}, inplace=True)
         df = df[~df['Name'].str.contains('스팩|우B|우|리츠|홀딩스', na=False)]
         
-        # [중요] 유동성 상위 200개로 축소 (안정성 확보)
+        # 유동성 상위 200개로 제한 (안정성)
         if 'Amount' in df.columns:
             df = df.sort_values('Amount', ascending=False).head(200)
             
@@ -87,10 +90,9 @@ def load_kr_data():
         return {"005930":"삼성전자"}, ["005930"]
 
 @st.cache_data(ttl=3600*24)
-def load_us_data(index_name='S&P 500'):
-    # (기존 코드 유지)
+def load_us_data():
     try:
-        # 간단하게 S&P500 상위 100개만 예시로 로딩 (속도 위해)
+        # S&P 500 리스트 (간단 버전)
         url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
         tables = pd.read_html(url)
         df = tables[0]
@@ -100,14 +102,9 @@ def load_us_data(index_name='S&P 500'):
     except:
         return {"AAPL":"Apple"}, ["AAPL"]
 
-# ==============================================================================
-# [데이터 로더 - 시계열 & 벤치마크]
-# ==============================================================================
 @st.cache_data(ttl=3600*24)
 def fetch_data_serial(universe, start_date, end_date, country):
-    """
-    [핵심 수정] 병렬 처리 제거하고 직렬로 확실하게 데이터 수집
-    """
+    """직렬 데이터 수집 (안정성 최우선)"""
     s_str = start_date.strftime('%Y-%m-%d')
     e_str = end_date.strftime('%Y-%m-%d')
     
@@ -115,7 +112,7 @@ def fetch_data_serial(universe, start_date, end_date, country):
     v_dict = {}
     bm_dict = {}
     
-    # 1. 벤치마크 로딩 (실패시 더미 데이터)
+    # 1. 벤치마크 로딩
     try:
         if country == "KR":
             kospi = fdr.DataReader('KS11', s_str, e_str)
@@ -126,11 +123,10 @@ def fetch_data_serial(universe, start_date, end_date, country):
                 bm_dict['S&P500'] = sp500['Close'] if 'Close' in sp500.columns else sp500.iloc[:,0]
     except: pass
     
-    # 2. 개별 종목 로딩 (Progress Bar 표시)
-    progress_text = "데이터 수집 중... (0%)"
-    my_bar = st.progress(0, text=progress_text)
-    
+    # 2. 개별 종목 로딩
+    progress_bar = st.progress(0, text="데이터 수집 준비...")
     total = len(universe)
+    
     for i, code in enumerate(universe):
         try:
             if country == "KR":
@@ -138,89 +134,79 @@ def fetch_data_serial(universe, start_date, end_date, country):
             else:
                 d = yf.download(code, start=s_str, end=e_str, progress=False)
             
-            # 데이터 유효성 검사
-            if len(d) > 100: # 최소 100일 이상 데이터
-                # 종가/거래량 추출
-                if 'Close' in d.columns: 
-                    p_dict[code] = d['Close']
-                elif 'Adj Close' in d.columns:
-                    p_dict[code] = d['Adj Close']
+            if len(d) > 60: # 최소 데이터 길이 완화
+                if 'Close' in d.columns: p_dict[code] = d['Close']
+                elif 'Adj Close' in d.columns: p_dict[code] = d['Adj Close']
                 
-                if 'Volume' in d.columns:
-                    v_dict[code] = d['Volume']
-                    
+                if 'Volume' in d.columns: v_dict[code] = d['Volume']
         except: pass
         
-        # 진행률 업데이트 (10개마다)
         if i % 10 == 0:
-            my_bar.progress((i + 1) / total, text=f"데이터 수집 중... ({i+1}/{total})")
+            progress_bar.progress((i + 1) / total, text=f"데이터 수집 중... ({i+1}/{total})")
             
-    my_bar.empty()
+    progress_bar.empty()
     
-    # 데이터프레임 변환 및 정렬
+    # DataFrame 변환
     df_p = pd.DataFrame(p_dict)
     df_v = pd.DataFrame(v_dict)
     
     if not df_p.empty:
-        # 전체 날짜 인덱스 생성 (빈 날짜 채우기)
         full_idx = pd.date_range(start=df_p.index.min(), end=df_p.index.max(), freq='B')
         df_p = df_p.reindex(full_idx).ffill()
         df_v = df_v.reindex(full_idx).fillna(0)
         
-        # 벤치마크도 인덱스 맞추기
         for k in bm_dict:
             bm_dict[k] = bm_dict[k].reindex(full_idx).ffill()
             
     return df_p, df_v, bm_dict
 
 # ==============================================================================
-# [Core Logic: 팩터 계산]
+# [Core Logic]
 # ==============================================================================
 def calculate_factors(price, volume, min_amt, trading_days=252):
-    # 데이터 길이 체크
-    if len(price) < 60: return None 
-    
-    # 거래대금 체크 (너무 작은 종목 제외)
+    if len(price) < 60: return None
     try:
-        amt = price * volume
-        if amt.iloc[-20:].mean() < min_amt: return None
+        # 최근 데이터 기준
+        p = price
+        v = volume
         
-        mom_short = price.pct_change(20).iloc[-1]
-        mom_mid = price.pct_change(60).iloc[-1]
-        vol = price.pct_change().tail(trading_days).std() * np.sqrt(trading_days)
-        liquidity = np.log1p(amt.iloc[-20:].mean())
-        mdd = (price.tail(trading_days) / price.tail(trading_days).cummax() - 1).min()
+        # 거래대금 체크 (너무 낮은 유동성 제외)
+        amt = p * v
+        if amt.tail(20).mean() < min_amt: return None
+        
+        mom_short = p.pct_change(20).iloc[-1]
+        mom_mid = p.pct_change(60).iloc[-1]
+        vol = p.pct_change().tail(trading_days).std() * np.sqrt(trading_days)
+        liquidity = np.log1p(amt.tail(20).mean())
+        mdd = (p.tail(trading_days) / p.tail(trading_days).cummax() - 1).min()
         
         return {
             'mom_short': mom_short, 'mom_mid': mom_mid,
             'volatility': vol, 'liquidity': liquidity, 'mdd': mdd,
-            'price': price.iloc[-1]
+            'price': p.iloc[-1]
         }
     except: return None
 
-# ==============================================================================
-# [랭킹 엔진]
-# ==============================================================================
 def rank_and_score(factor_df, weights, ticker_map=None):
     if factor_df.empty: return factor_df
     scored = factor_df.copy()
     
-    if ticker_map: 
+    if ticker_map:
         scored['sector'] = [infer_sector_kr(ticker_map.get(x, x)) for x in scored.index]
-    else: 
+    else:
         scored['sector'] = 'Unknown'
 
-    # Z-Score 계산 (NaN 방어)
+    # 결측치 처리 (중간값)
     for col in ['mom_short', 'mom_mid', 'volatility', 'liquidity', 'mdd']:
-        scored[col] = scored[col].fillna(scored[col].median()) # 결측치는 중간값으로
-        
+        if col in scored.columns:
+            scored[col] = scored[col].fillna(scored[col].median())
+
     scored['Z_Mom_S'] = z_score(scored['mom_short'])
     scored['Z_Mom_M'] = z_score(scored['mom_mid'])
     scored['Z_Vol'] = z_score(scored['volatility']) * -1 
     scored['Z_Liq'] = z_score(scored['liquidity'])
     scored['Z_MDD'] = z_score(scored['mdd']) 
     
-    # 펀더멘털은 여기선 생략 (속도/안정성 위해) -> 기술적 점수로만 랭킹
     scored['Total_Score'] = (
         scored['Z_Mom_S'] * weights['mom'] * 0.5 + 
         scored['Z_Mom_M'] * weights['mom'] * 0.5 +
@@ -231,38 +217,34 @@ def rank_and_score(factor_df, weights, ticker_map=None):
     
     return scored.sort_values(by='Total_Score', ascending=False)
 
-# ==============================================================================
-# [백테스트 엔진]
-# ==============================================================================
 def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
     if prices.empty: return pd.DataFrame()
     
-    # 월말 리밸런싱
     reb_dates = prices.resample('BM').last().index
-    logs = []
-    prev_picks = [] 
+    logs, prev_picks = [], []
     
     # 벤치마크 안전 처리
     if benchmark is None or benchmark.empty:
-        benchmark = pd.Series(1.0, index=prices.index) # 더미
-        
+        benchmark = pd.Series(1.0, index=prices.index)
+    else:
+        benchmark = benchmark.reindex(prices.index).ffill().fillna(method='bfill') # 앞뒤로 다 채움
+
     for i in range(12, len(reb_dates)):
         rebal_date = reb_dates[i]
         
-        # 다음 리밸런싱 날짜 확인
         if i < len(reb_dates) - 1: next_rebal = reb_dates[i+1]
         else: next_rebal = prices.index[-1]
         
         if rebal_date >= next_rebal: break
             
         try:
-            # 과거 데이터 슬라이싱
+            # 1. 팩터 계산
             p_sub = prices.loc[:rebal_date].tail(300)
             v_sub = volumes.loc[:rebal_date].tail(300)
             
-            # 유효 종목 필터링 (NaN 없는 것들)
+            # 유효 종목 (최근 가격 있는 것만)
             valid_cols = p_sub.columns[p_sub.iloc[-1].notna()]
-            if len(valid_cols) < 5: continue # 최소 5개는 있어야 함
+            if len(valid_cols) < 5: continue
             
             daily_factors = []
             for t in valid_cols:
@@ -272,14 +254,17 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
             
             if not daily_factors: continue
             
-            # 랭킹 산정
+            # 2. 랭킹
             factor_df = pd.DataFrame(daily_factors).set_index('code')
             ranked = rank_and_score(factor_df, weights, ticker_map=ticker_map)
-            picks = ranked.head(const['TOP_N']).index.tolist()
+            
+            # 상위 N개 (부족하면 있는 만큼만)
+            n_picks = min(const['TOP_N'], len(ranked))
+            picks = ranked.head(n_picks).index.tolist()
             
             if not picks: continue
             
-            # 수익률 계산 (T+1 매수)
+            # 3. 수익률 계산
             buy_idx = prices.index.searchsorted(rebal_date) + 1
             if buy_idx >= len(prices): buy_idx = len(prices) - 1
             buy_date = prices.index[buy_idx]
@@ -295,7 +280,7 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
             ret_vec = ret_vec.fillna(0)
             gross_ret = ret_vec.mean()
             
-            # 턴오버/비용
+            # 4. 비용 및 벤치마크
             if not prev_picks: turnover = 1.0
             else:
                 denom = len(picks) if len(picks)>0 else 1
@@ -304,13 +289,11 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
                 
             net_ret = gross_ret - (turnover * const['COST_RATE'])
             
-            # 벤치마크 수익률
             try:
                 b_s = benchmark.asof(buy_date)
                 b_e = benchmark.asof(sell_date)
-                if isinstance(b_s, pd.Series): b_s = b_s.iloc[0] # 시리즈면 값 추출
+                if isinstance(b_s, pd.Series): b_s = b_s.iloc[0]
                 if isinstance(b_e, pd.Series): b_e = b_e.iloc[0]
-                
                 bm_ret = (b_e / b_s) - 1 if b_s != 0 else 0.0
             except: bm_ret = 0.0
                 
@@ -322,19 +305,58 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
             })
             prev_picks = picks
             
-        except Exception as e:
-            continue
+        except: continue
             
     return pd.DataFrame(logs)
+
+def optimize_strategy(prices, volumes, ticker_map, presets, const):
+    results = []
+    if prices.empty: return pd.DataFrame()
+    prog = st.progress(0, text="시뮬레이션 시작...")
+    
+    for i, (name, w) in enumerate(presets.items()):
+        weights = {'mom': w[0], 'liq': w[1], 'vol': w[2], 'risk': w[3]}
+        try:
+            res = run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None)
+            if not res.empty:
+                res = res.set_index('Date')
+                res['Cum'] = (1+res['Port_Ret']).cumprod()
+                
+                tot = res['Cum'].iloc[-1]-1
+                y = len(res)/12
+                cagr = (tot+1)**(1/y)-1 if y>0 else 0
+                mdd = (res['Cum']/res['Cum'].cummax()-1).min()
+                win = (res['Port_Ret']>0).sum()/len(res)
+                
+                results.append({
+                    '전략명': name, '승률': win, 'CAGR': cagr, '누적수익': tot, 'MDD': mdd
+                })
+        except: pass
+        prog.progress((i+1)/len(presets), text=f"분석 중: {name}")
+    
+    prog.empty()
+    if not results: return pd.DataFrame()
+    return pd.DataFrame(results).sort_values('CAGR', ascending=False)
+
+def highlight_top3(s):
+    is_small = s.name in ['변동성']
+    sorted_vals = s.sort_values(ascending=is_small).unique()
+    styles = []
+    for v in s:
+        if len(sorted_vals)>0 and v==sorted_vals[0]: styles.append('background-color: #FFD700; color: black; font-weight: bold')
+        elif len(sorted_vals)>1 and v==sorted_vals[1]: styles.append('color: #FF4B4B; font-weight: bold')
+        elif len(sorted_vals)>2 and v==sorted_vals[2]: styles.append('font-weight: bold')
+        else: styles.append('')
+    return styles
 
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🌍 Alpha Seeking Pro (Final v5.3)")
+st.title("🌍 Alpha Seeking Pro (Final v5.4)")
 
 with st.sidebar:
     st.header("🏳️ 시장 선택")
-    market = st.radio("국가", ["🇰🇷 한국 (Korea)", "🇺🇸 미국 (USA)"], horizontal=True)
+    market = st.radio("국가", ["🇰🇷 한국 (Korea)", "🇺🇸 미국 (USA)"], key="market_radio")
     
     if "한국" in market:
         COUNTRY, CURRENCY, COST_RATE, MIN_AMT = "KR", "원", 0.002, 5_000_000_000
@@ -346,10 +368,10 @@ with st.sidebar:
             
     CONST['MIN_AMT'], CONST['COST_RATE'] = MIN_AMT, COST_RATE
     
-    if st.button("🧹 캐시 초기화"): st.cache_data.clear(); st.rerun()
+    if st.button("🧹 캐시 초기화", key="clear_cache"): st.cache_data.clear(); st.rerun()
     st.divider()
     
-    mode = st.radio("모드 선택", ["📉 백테스트", "🔍 전략 최적화"])
+    mode = st.radio("모드 선택", ["📉 백테스트", "🔍 전략 최적화"], key="mode_radio")
     st.divider()
     
     PRESETS = {
@@ -357,27 +379,23 @@ with st.sidebar:
         "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🐆 안전한 사냥": (0.8, 0.7, 0.1, 0.8),
         "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8)
     }
-    sel_preset = st.selectbox("전략 프리셋", list(PRESETS.keys()), index=3)
+    sel_preset = st.selectbox("전략 프리셋", list(PRESETS.keys()), index=3, key="preset_select")
     dw = PRESETS[sel_preset]
-    w_mom = st.slider("📈 추세", 0.0, 1.0, dw[0], 0.1)
-    w_liq = st.slider("🌊 수급", 0.0, 1.0, dw[1], 0.1)
-    w_vol = st.slider("⚖️ 저변동", 0.0, 1.0, dw[2], 0.1)
-    w_risk = st.slider("🛡️ 방어", 0.0, 1.0, dw[3], 0.1)
+    w_mom = st.slider("📈 추세", 0.0, 1.0, dw[0], 0.1, key="slider_mom")
+    w_liq = st.slider("🌊 수급", 0.0, 1.0, dw[1], 0.1, key="slider_liq")
+    w_vol = st.slider("⚖️ 저변동", 0.0, 1.0, dw[2], 0.1, key="slider_vol")
+    w_risk = st.slider("🛡️ 방어", 0.0, 1.0, dw[3], 0.1, key="slider_risk")
     weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
 
 if mode == "📉 백테스트":
     c1, c2 = st.columns(2)
-    with c1: s_d = st.date_input("시작", CONST['DEFAULT_START_DATE'])
-    with c2: e_d = st.date_input("종료", get_last_complete_month_end())
+    with c1: s_d = st.date_input("시작", CONST['DEFAULT_START_DATE'], key="start_date")
+    with c2: e_d = st.date_input("종료", get_last_complete_month_end(), key="end_date")
     
-    if st.button("실행", type="primary"):
-        u = ALL_STOCKS # 전체 대상
-        
-        # [데이터 수집]
-        p, v, bms = fetch_data_serial(u, s_d, e_d, COUNTRY)
+    if st.button("실행", type="primary", key="btn_run_backtest"):
+        p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d, COUNTRY)
         
         if not p.empty:
-            # 메인 벤치마크 (KOSPI or S&P500)
             main_bm = bms.get('KOSPI') if COUNTRY=="KR" else bms.get('S&P500')
             if main_bm is None and bms: main_bm = list(bms.values())[0]
             
@@ -387,11 +405,9 @@ if mode == "📉 백테스트":
                 res = res.set_index('Date')
                 res['Cum'] = (1+res['Port_Ret']).cumprod()
                 
-                # 차트
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=res.index, y=res['Cum'], name="Strategy", line=dict(width=3, color='blue')))
                 
-                # 벤치마크 추가
                 colors = ['red', 'green', 'orange']
                 for i, (k, v_bm) in enumerate(bms.items()):
                     try:
@@ -412,7 +428,7 @@ if mode == "📉 백테스트":
 
 elif mode == "🔍 전략 최적화":
     st.info("전략별 성과를 비교합니다.")
-    if st.button("비교 시작"):
+    if st.button("비교 시작", key="btn_run_opt"):
         p, v, bms = fetch_data_serial(ALL_STOCKS, datetime(2018,1,1), datetime.now(), COUNTRY)
         
         if not p.empty:
