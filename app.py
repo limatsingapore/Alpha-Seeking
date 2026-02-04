@@ -8,12 +8,13 @@ import logging
 import FinanceDataReader as fdr
 import yfinance as yf
 import requests
+import time
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v5.1)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v5.2)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -82,13 +83,13 @@ def load_benchmarks(country, start, end):
     
     try:
         if country == "KR":
+            # KRX 지수 (KS11, KQ11)
             try: bm['KOSPI'] = fdr.DataReader('KS11', s_str, e_str)['Close']
             except: pass
             try: bm['KOSDAQ'] = fdr.DataReader('KQ11', s_str, e_str)['Close']
             except: pass
-            try: bm['KOSPI200'] = fdr.DataReader('KS200', s_str, e_str)['Close']
-            except: pass
         else:
+            # US 지수
             tickers = {'S&P500': '^GSPC', 'NASDAQ': '^IXIC', 'DOW': '^DJI'}
             for name, ticker in tickers.items():
                 try:
@@ -100,7 +101,6 @@ def load_benchmarks(country, start, end):
                     
                     if hasattr(series.index, 'tz_localize'):
                         series.index = pd.to_datetime(series.index).tz_localize(None)
-                    
                     bm[name] = series
                 except: pass
     except: pass
@@ -118,7 +118,7 @@ def load_kr_data():
         if 'Symbol' in df.columns: df.rename(columns={'Symbol':'Code'}, inplace=True)
         df = df[~df['Name'].str.contains('스팩|우B|우|리츠|홀딩스', na=False)]
         if 'Amount' in df.columns:
-            df = df.sort_values('Amount', ascending=False).head(600)
+            df = df.sort_values('Amount', ascending=False).head(500)
         return df.set_index('Code')['Name'].to_dict(), df['Code'].tolist()
     except:
         return {"005930":"삼성전자"}, ["005930"]
@@ -279,30 +279,41 @@ def rank_and_score(factor_df, weights, ticker_map=None):
     return scored.sort_values(by='Total_Score', ascending=False)
 
 # ==============================================================================
-# [백테스트 데이터 페처] (벤치마크 로딩 제거)
+# [백테스트 데이터 페처] (안정성 강화: 병렬 -> 직렬/청크 변경)
 # ==============================================================================
 @st.cache_data(ttl=3600*24)
 def fetch_backtest_data(universe, start_date, end_date, country):
     s_str, e_str = start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
     p, v = {}, {}
     
-    def get(code):
-        try:
-            if country == "KR": d = fdr.DataReader(code, s_str, e_str)
-            else: return None 
-            d.index = pd.to_datetime(d.index).tz_localize(None)
-            # 최근 데이터까지 확실하게 포함되도록 ffill
-            return code, d['Close'].ffill(), d['Volume'].fillna(0)
-        except: return None
-
+    # 한국 주식 데이터 로딩 (안정성 최우선: 속도가 느려도 확실하게)
     if country == "KR":
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-            futures = [ex.submit(get, c) for c in universe]
-            for fut in concurrent.futures.as_completed(futures):
-                res = fut.result()
-                if res: 
-                    if len(res[1]) > 100: p[res[0]], v[res[0]] = res[1], res[2]
+        progress_bar = st.progress(0, text="데이터 수집 중... (KRX)")
+        # 500개 종목을 10개씩 끊어서 처리 (Chunking)
+        chunk_size = 10
+        chunks = [universe[i:i + chunk_size] for i in range(0, len(universe), chunk_size)]
+        
+        for idx, chunk in enumerate(chunks):
+            try:
+                # 청크 단위로 데이터 요청 (병렬 말고 직렬로 안전하게)
+                for code in chunk:
+                    try:
+                        d = fdr.DataReader(code, s_str, e_str)
+                        if len(d) > 100: # 데이터가 충분한 경우만
+                            p[code] = d['Close']
+                            v[code] = d['Volume']
+                    except: pass
+            except: pass
+            
+            # 진행률 표시
+            progress = (idx + 1) / len(chunks)
+            progress_bar.progress(progress, text=f"데이터 수집 중... ({idx+1}/{len(chunks)} 그룹)")
+            # time.sleep(0.1) # 서버 부하 방지용 딜레이 (필요시 주석 해제)
+            
+        progress_bar.empty()
+
     else:
+        # 미국 주식 (yfinance는 병렬 처리가 잘 됨)
         try:
             d = yf.download(universe, start=s_str, end=e_str, group_by='ticker', progress=False, threads=True)
             if isinstance(d.columns, pd.MultiIndex):
@@ -313,16 +324,20 @@ def fetch_backtest_data(universe, start_date, end_date, country):
                         elif 'Close' in d[t]: s = d[t]['Close']
                         else: continue
                         vo = d[t]['Volume'] if 'Volume' in d[t] else None
+                        
+                        # 인덱스 타임존 제거
                         s.index = pd.to_datetime(s.index).tz_localize(None)
                         if vo is not None: vo.index = pd.to_datetime(vo.index).tz_localize(None)
+                        
                         if len(s) > 100: p[t], v[t] = s.ffill(), vo.fillna(0)
         except: pass
 
-    # [중요] 전체 데이터프레임의 인덱스를 합집합으로 재설정하여 날짜 누락 방지
+    # 데이터프레임 생성 및 정렬
     df_p = pd.DataFrame(p)
     df_v = pd.DataFrame(v)
     
     if not df_p.empty:
+        # 날짜 인덱스 전체 채우기 (휴장일 제외 영업일 기준)
         full_idx = pd.date_range(start=df_p.index.min(), end=df_p.index.max(), freq='B')
         df_p = df_p.reindex(full_idx).ffill()
         df_v = df_v.reindex(full_idx).fillna(0)
@@ -330,43 +345,58 @@ def fetch_backtest_data(universe, start_date, end_date, country):
     return df_p, df_v
 
 # ==============================================================================
-# [백테스트 엔진] (수정: 인자 불일치 해결 및 벤치마크 처리)
+# [백테스트 엔진] (벤치마크 처리 강화)
 # ==============================================================================
 def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
     if prices.empty: return pd.DataFrame()
     reb_dates = prices.resample('BM').last().index
     logs, prev_picks = [], []
     
-    # benchmark가 None일 경우 빈 시리즈로 처리
+    # 벤치마크 데이터가 없으면 0으로 채워서 에러 방지
     if benchmark is None or benchmark.empty:
         benchmark = pd.Series(0, index=prices.index)
+    else:
+        # 벤치마크 인덱스 맞추기
+        benchmark = benchmark.reindex(prices.index).ffill().fillna(0)
 
     for i in range(12, len(reb_dates)):
         rebal_date = reb_dates[i]
         if i < len(reb_dates) - 1: next_rebal = reb_dates[i+1]
         else: next_rebal = prices.index[-1]
+        
         if rebal_date >= next_rebal: break
             
         try:
             p_sub = prices.loc[:rebal_date].tail(300)
             v_sub = volumes.loc[:rebal_date].tail(300)
         except: continue
+        
         if p_sub.empty: continue
 
-        active_tickers = p_sub.columns[p_sub.iloc[-1].notna()]
+        # 유효한 종목만 필터링
+        valid_cols = p_sub.columns[p_sub.iloc[-1].notna()]
+        if len(valid_cols) == 0: continue
+        
         daily_factors = []
-        for t in active_tickers:
+        # 속도 향상을 위해 벡터화 가능하지만, 안정성을 위해 일단 유지 (추후 개선 가능)
+        for t in valid_cols:
             f = calculate_factors(p_sub[t], v_sub[t], const['MIN_AMT'])
             if f:
                 f['code'] = t; daily_factors.append(f)
+        
         if not daily_factors: continue
         
         factor_df = pd.DataFrame(daily_factors).set_index('code')
         ranked = rank_and_score(factor_df, weights, ticker_map=ticker_map)
-        picks = ranked.head(const['TOP_N']).index.tolist()
+        
+        # 상위 N개 선택 (데이터가 부족하면 있는 만큼만)
+        n_picks = min(const['TOP_N'], len(ranked))
+        picks = ranked.head(n_picks).index.tolist()
+        
         if not picks: continue
         
         try:
+            # 매매 시점 (T+1)
             buy_idx = prices.index.searchsorted(rebal_date) + 1
             if buy_idx >= len(prices): buy_idx = len(prices) - 1
             buy_date = prices.index[buy_idx]
@@ -386,19 +416,17 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
         if not prev_picks: turnover = 1.0 
         else:
             kept = set(prev_picks) & set(picks)
-            turnover = (const['TOP_N'] - len(kept)) / const['TOP_N']
+            # 분모가 0이 되지 않도록 방어
+            denom = len(picks) if len(picks) > 0 else 1
+            turnover = (denom - len(kept)) / denom
             
         net_ret = gross_ret - (turnover * const['COST_RATE'])
         
-        # 벤치마크 수익률 계산 (안전하게)
+        # 벤치마크 수익률
         try:
-            if isinstance(benchmark, pd.Series) and not benchmark.empty:
-                b_s = benchmark.asof(buy_date)
-                b_e = benchmark.asof(sell_date)
-                if pd.isna(b_s) or b_s == 0: bm_ret = 0.0
-                else: bm_ret = (b_e / b_s) - 1
-            else:
-                bm_ret = 0.0
+            b_s = benchmark.asof(buy_date)
+            b_e = benchmark.asof(sell_date)
+            bm_ret = (b_e / b_s) - 1 if (b_s != 0 and not pd.isna(b_s)) else 0.0
         except: bm_ret = 0.0
             
         logs.append({
@@ -411,20 +439,17 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
     return pd.DataFrame(logs)
 
 # ==============================================================================
-# [전략 최적화] (수정: 인자 전달 방식 개선)
+# [전략 최적화]
 # ==============================================================================
 def optimize_strategy(prices, volumes, ticker_map, presets, const):
     results = []
     if prices.empty: return pd.DataFrame()
     prog = st.progress(0, text="시뮬레이션 시작...")
     
-    # 최적화에서는 벤치마크 비교가 핵심이 아니므로 None 전달하여 속도 향상
-    # (필요시 fetch_backtest_data에서 benchmark를 받아와서 넘길 수도 있음)
-    
     for i, (name, w) in enumerate(presets.items()):
         weights = {'mom': w[0], 'liq': w[1], 'vol': w[2], 'risk': w[3]}
         try:
-            # benchmark=None 전달
+            # Benchmark는 최적화 단계에선 생략 (속도)
             res = run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None)
             if not res.empty:
                 res = res.set_index('Date')
@@ -464,7 +489,7 @@ def highlight_top3(s):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🌍 Alpha Seeking Pro (Final v5.1)")
+st.title("🌍 Alpha Seeking Pro (Final v5.2)")
 
 with st.sidebar:
     st.header("🏳️ 시장 선택")
@@ -473,7 +498,7 @@ with st.sidebar:
     
     if "한국" in market:
         COUNTRY, CURRENCY, COST_RATE, MIN_AMT, BM_NAME = "KR", "원", 0.002, 5_000_000_000, "KOSPI"
-        st.info("대상: 유동성 상위 600개")
+        st.info("대상: 유동성 상위 500개")
         TICKER_INFO, ALL_STOCKS = load_kr_data()
     else:
         COUNTRY, CURRENCY, COST_RATE, MIN_AMT, BM_NAME = "US", "$", 0.0005, 5_000_000, "S&P 500"
@@ -625,14 +650,15 @@ elif mode == "📉 백테스트":
     with c2: e_d = st.date_input("종료", get_last_complete_month_end())
     
     if st.button("실행", type="primary"):
-        with st.spinner("시뮬레이션..."):
+        with st.spinner("시뮬레이션... (KRX는 속도 제한으로 시간이 걸립니다)"):
             u = ALL_STOCKS[:400] if len(ALL_STOCKS)>400 else ALL_STOCKS
             p, v = fetch_backtest_data(u, s_d, e_d, COUNTRY)
             bms = load_benchmarks(COUNTRY, s_d, e_d)
             
             if not p.empty:
-                # benchmark 인자 전달 (주요 지수 중 하나 선택)
-                main_bm = list(bms.values())[0] if bms else None
+                # 메인 벤치마크 선택
+                main_bm = bms.get('KOSPI') if COUNTRY == "KR" else bms.get('S&P500')
+                if main_bm is None and bms: main_bm = list(bms.values())[0]
                 
                 res = run_backtest(p, v, weights, TICKER_INFO, CONST, benchmark=main_bm)
                 if not res.empty:
@@ -662,13 +688,12 @@ else: # 최적화
     with c2: e_d = st.date_input("종료", get_last_complete_month_end())
     
     if st.button("전체 전략 비교"):
-        with st.spinner("시뮬레이션..."):
+        with st.spinner("시뮬레이션... (KRX는 속도 제한으로 시간이 걸립니다)"):
             u = ALL_STOCKS[:400] if len(ALL_STOCKS)>400 else ALL_STOCKS
             p, v = fetch_backtest_data(u, s_d, e_d, COUNTRY)
             
             if not p.empty:
                 presets = {k:v for k,v in PRESETS.items() if k!="사용자 정의"}
-                # 여기서는 benchmark=None (속도 최적화)
                 res = optimize_strategy(p, v, ticker_map=TICKER_INFO, presets=presets, const=CONST)
                 if not res.empty:
                     st.dataframe(res.style.apply(highlight_top3, subset=['승률', 'CAGR', '누적수익', 'MDD', '샤프', '변동성'])
@@ -681,7 +706,7 @@ else: # 최적화
                     parts = ws_str.split('|')
                     w_dict = {'mom': float(parts[0]), 'liq': float(parts[1]), 'vol': float(parts[2]), 'risk': float(parts[3])}
                     
-                    # 1등 전략 상세 차트
+                    # 1등 상세 차트
                     bms = load_benchmarks(COUNTRY, s_d, e_d)
                     main_bm = list(bms.values())[0] if bms else None
                     res_best = run_backtest(p, v, w_dict, TICKER_INFO, CONST, benchmark=main_bm)
