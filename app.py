@@ -5,14 +5,13 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import logging
 import FinanceDataReader as fdr
-import yfinance as yf
 import time
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v6.0)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v6.1)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -50,10 +49,6 @@ def z_score(x):
     return (x - x.mean()) / x.std()
 
 def infer_sector_kr(name):
-    """
-    섹터 중립화를 위한 필수 로직입니다. 
-    이게 없으면 제조업과 금융업을 직접 비교하게 되어 랭킹이 왜곡됩니다.
-    """
     name = str(name)
     if any(x in name for x in ['스팩', '제호', '기업인수']): return '스팩/금융'
     if any(x in name for x in ['우', '우B']): return '우선주'
@@ -236,11 +231,10 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
             
             if not picks: continue
             
-            # [수정] 결과 테이블 생성을 위해 가격 데이터 저장
+            # [Table Data Prep]
             current_prices = {}
             for t in picks:
-                if t in daily_factors[0]: # Check if price key exists
-                     # Find price in daily_factors list
+                if t in daily_factors[0]: # Check logic
                      for item in daily_factors:
                          if item['code'] == t:
                              current_prices[t] = item['price']
@@ -278,14 +272,14 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
             except: bm_ret = 0.0
                 
             logs.append({
-                'Date': rebal_date, # 리밸런싱 기준일 (테이블 표시용)
-                'Sell_Date': sell_date, # 실제 매도일 (수익 확정일)
+                'Date': rebal_date,
+                'Sell_Date': sell_date, 
                 'Gross_Ret': gross_ret, 
                 'Net_Ret': net_ret,
                 'BM_Ret': bm_ret, 
                 'Turnover': turnover,
-                'Holdings_List': picks, # 코드 리스트 저장
-                'Prices_Dict': current_prices, # 당시 가격 저장
+                'Holdings_List': picks, 
+                'Prices_Dict': current_prices, 
                 'Port_Ret': net_ret
             })
             prev_picks = picks
@@ -304,7 +298,7 @@ def optimize_strategy(prices, volumes, ticker_map, presets, const):
         try:
             res = run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None)
             if not res.empty:
-                res_calc = res.set_index('Sell_Date') # 수익률 계산용 인덱스
+                res_calc = res.set_index('Sell_Date') 
                 cum = (1+res_calc['Port_Ret']).cumprod()
                 
                 tot = cum.iloc[-1]-1
@@ -327,7 +321,7 @@ def optimize_strategy(prices, volumes, ticker_map, presets, const):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v6.0)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v6.1)")
 
 with st.sidebar:
     st.info("대상: KOSPI/KOSDAQ 유동성 상위 200개")
@@ -339,12 +333,26 @@ with st.sidebar:
     mode = st.radio("모드 선택", ["📉 백테스트", "🔍 전략 최적화"], key="mode_radio")
     st.divider()
     
+    # [16개 프리셋 완전 복구]
     PRESETS = {
-        "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
-        "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🐆 안전한 사냥": (0.8, 0.7, 0.1, 0.8),
-        "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8)
+        "사용자 정의": (0.5, 0.5, 0.5, 0.5), 
+        "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
+        "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), 
+        "🌊 세력주 포착": (0.4, 1.0, 0.2, 0.2),
+        "🏰 철벽 방어": (0.1, 0.1, 1.0, 1.0), 
+        "🧘 마음의 평화": (0.3, 0.2, 1.0, 0.5),
+        "🚑 좀비 헌터": (0.4, 0.3, 0.3, 1.0), 
+        "⚖️ 황금 밸런스": (0.5, 0.5, 0.5, 0.5),
+        "💎 우상향 정석": (0.7, 0.3, 0.7, 0.4), 
+        "🐆 안전한 사냥": (0.8, 0.7, 0.1, 0.8),
+        "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8),
+        "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1), 
+        "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9),
+        "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6), 
+        "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2),
+        "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7)
     }
-    sel_preset = st.selectbox("전략 프리셋", list(PRESETS.keys()), index=3, key="preset_select")
+    sel_preset = st.selectbox("전략 프리셋", list(PRESETS.keys()), index=5, key="preset_select")
     dw = PRESETS[sel_preset]
     w_mom = st.slider("📈 추세", 0.0, 1.0, dw[0], 0.1, key="slider_mom")
     w_liq = st.slider("🌊 수급", 0.0, 1.0, dw[1], 0.1, key="slider_liq")
@@ -367,7 +375,6 @@ if mode == "📉 백테스트":
             res = run_backtest(p, v, weights, TICKER_INFO, CONST, benchmark=main_bm)
             
             if not res.empty:
-                # 차트용 데이터 (Date 기준이 아니라 Sell_Date 기준)
                 res_chart = res.set_index('Sell_Date')
                 res_chart['Cum'] = (1+res_chart['Port_Ret']).cumprod()
                 
@@ -389,9 +396,8 @@ if mode == "📉 백테스트":
                 st.divider()
                 st.subheader("📅 월별 포트폴리오 상세 분석")
                 
-                # 날짜 선택 (리밸런싱 기준일)
                 date_options = res['Date'].dt.strftime('%Y-%m-%d').tolist()
-                sel_date_str = st.selectbox("리밸런싱 날짜 선택", date_options[::-1], index=0) # 최신순
+                sel_date_str = st.selectbox("리밸런싱 날짜 선택", date_options[::-1], index=0)
                 
                 if sel_date_str:
                     sel_date = pd.to_datetime(sel_date_str)
@@ -400,7 +406,6 @@ if mode == "📉 백테스트":
                     codes = row['Holdings_List']
                     prices_dict = row['Prices_Dict']
                     
-                    # 상세 테이블 생성
                     detail_data = []
                     for c in codes:
                         name = TICKER_INFO.get(c, c)
