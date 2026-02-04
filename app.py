@@ -6,13 +6,13 @@ import plotly.graph_objects as go
 import logging
 import FinanceDataReader as fdr
 import time
-from scipy.stats import linregress 
+# [수정] Scipy 제거 (Numpy로 대체하여 가볍게 만듦)
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v7.3)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v7.4)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -188,7 +188,6 @@ def rank_and_score(factor_df, weights, ticker_map=None):
     if factor_df.empty: return factor_df
     scored = factor_df.copy()
     
-    # [수정 1] 섹터 분류 시 Code 전달 (버그 수정)
     if ticker_map:
         scored['sector'] = [infer_sector_kr(ticker_map.get(x, x), x) for x in scored.index]
     else:
@@ -229,8 +228,6 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
     prev_picks = [] 
     
     target_n = get_optimal_holdings(initial_capital)
-    
-    # [수정 4] 복리 자본금 추적 변수
     current_capital = initial_capital
     
     if benchmark is None or benchmark.empty:
@@ -247,7 +244,6 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
         if rebal_date >= next_rebal: break
             
         try:
-            # [수정 4] 매월 현재 자본금 기준으로 최소 거래대금 재산정
             min_trade_amt = (current_capital / target_n) * 50
             
             rebal_idx = prices.index.searchsorted(rebal_date)
@@ -296,15 +292,13 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
                 kept = set(prev_picks) & set(picks)
                 turnover = (denom - len(kept)) / denom
             
-            buy_vol = volumes.loc[buy_date, picks]
             target_amt_per_stock = current_capital / target_n
             
             s_costs = []
             for t in picks:
                 avg_v = volumes.loc[:buy_date, t].tail(20).mean()
-                # [수정 3] 슬리피지 NaN 체크
                 if np.isnan(avg_v) or avg_v == 0:
-                    s_costs.append(0.01) # Penalty
+                    s_costs.append(0.01)
                 else:
                     s_costs.append(calculate_slippage(target_amt_per_stock, avg_v))
             avg_slippage = np.mean(s_costs) if s_costs else 0.002
@@ -330,11 +324,10 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
                 'Holdings_List': picks, 
                 'Prices_Dict': current_prices, 
                 'Port_Ret': net_ret,
-                'Capital': current_capital # 기록용
+                'Capital': current_capital 
             })
             prev_picks = picks
             
-            # [수정 4] 복리 적용: 자본금 업데이트
             current_capital = current_capital * (1 + net_ret)
             
         except: continue
@@ -355,10 +348,12 @@ def calculate_metrics(res_df):
     cum = (1 + res_df['Port_Ret']).cumprod()
     mdd = (cum / cum.cummax() - 1).min()
     
-    # [수정 2] 알파/베타 선형회귀 사용
+    # [수정] Scipy 대체: Numpy로 알파/베타 계산
     try:
         if len(res_df) > 1:
-            slope, intercept, r_val, p_val, std_err = linregress(res_df['BM_Ret'], res_df['Port_Ret'])
+            # np.polyfit(x, y, 1) -> 1차함수 (선형회귀)
+            # x: Benchmark Return, y: Portfolio Return
+            slope, intercept = np.polyfit(res_df['BM_Ret'], res_df['Port_Ret'], 1)
             beta = slope
             alpha = intercept * 12 # 연율화
         else:
@@ -403,7 +398,7 @@ def optimize_strategy(prices, volumes, ticker_map, presets, const, initial_capit
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v7.3)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v7.4)")
 
 with st.sidebar:
     st.info("대상: KOSPI/KOSDAQ 유동성 상위 200개")
@@ -473,7 +468,6 @@ if mode == "📉 백테스트":
                     
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # [수정 5] 자본금 추이 차트 추가 (복리 효과 시각화)
                 if 'Capital' in res_chart.columns:
                     fig_cap = go.Figure()
                     fig_cap.add_trace(go.Scatter(x=res_chart.index, y=res_chart['Capital'], name='Total Capital', line=dict(color='green')))
@@ -507,7 +501,7 @@ if mode == "📉 백테스트":
                     
                     df_detail = pd.DataFrame(detail_data)
                     st.dataframe(df_detail, use_container_width=True)
-                    st.caption(f"※ {sel_date_str} 당일 종가에 매수 체결된 내역입니다.")
+                    st.caption(f"※ 선정 기준일(T-1)의 데이터로 분석하여 {sel_date_str} 당일(T) 종가에 매수한 내역입니다.")
 
             else:
                 st.error("백테스트 결과가 없습니다. (기간 내 데이터 부족)")
