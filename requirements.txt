@@ -4,4 +4,3 @@ finance-datareader
 plotly
 streamlit
 requests
-scipy
