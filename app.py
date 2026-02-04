@@ -6,13 +6,13 @@ import plotly.graph_objects as go
 import logging
 import FinanceDataReader as fdr
 import time
-# [수정] Scipy 제거 (Numpy로 대체하여 가볍게 만듦)
+# Scipy 제거 (Numpy로 대체)
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v7.4)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v7.5)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -158,7 +158,7 @@ def fetch_data_serial(universe, start_date, end_date):
     return df_p, df_v, bm_dict
 
 # ==============================================================================
-# [Core Logic: 팩터 계산]
+# [Core Logic]
 # ==============================================================================
 def calculate_factors(price, volume, min_amt, trading_days=252):
     if len(price) < 120 or price.iloc[-1] == 0 or np.isnan(price.iloc[-1]): return None
@@ -217,9 +217,6 @@ def rank_and_score(factor_df, weights, ticker_map=None):
     
     return scored.sort_values(by='Total_Score', ascending=False)
 
-# ==============================================================================
-# [백테스트 엔진: 복리 + 슬리피지 + T+1]
-# ==============================================================================
 def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, initial_capital=100_000_000):
     if prices.empty: return pd.DataFrame()
     
@@ -348,14 +345,11 @@ def calculate_metrics(res_df):
     cum = (1 + res_df['Port_Ret']).cumprod()
     mdd = (cum / cum.cummax() - 1).min()
     
-    # [수정] Scipy 대체: Numpy로 알파/베타 계산
     try:
         if len(res_df) > 1:
-            # np.polyfit(x, y, 1) -> 1차함수 (선형회귀)
-            # x: Benchmark Return, y: Portfolio Return
             slope, intercept = np.polyfit(res_df['BM_Ret'], res_df['Port_Ret'], 1)
             beta = slope
-            alpha = intercept * 12 # 연율화
+            alpha = intercept * 12 
         else:
             beta, alpha = 1.0, 0.0
     except:
@@ -398,7 +392,29 @@ def optimize_strategy(prices, volumes, ticker_map, presets, const, initial_capit
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v7.4)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v7.5)")
+
+# 프리셋 정의 (사이드바 밖에서 먼저 선언)
+PRESETS = {
+    "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
+    "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🌊 세력주 포착": (0.4, 1.0, 0.2, 0.2),
+    "🏰 철벽 방어": (0.1, 0.1, 1.0, 1.0), "🧘 마음의 평화": (0.3, 0.2, 1.0, 0.5),
+    "🚑 좀비 헌터": (0.4, 0.3, 0.3, 1.0), "⚖️ 황금 밸런스": (0.5, 0.5, 0.5, 0.5),
+    "💎 우상향 정석": (0.7, 0.3, 0.7, 0.4), "🐆 안전한 사냥": (0.8, 0.7, 0.1, 0.8),
+    "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8), "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1), 
+    "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9), "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6), 
+    "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2), "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7)
+}
+
+# 콜백 함수 (프리셋 변경 시 슬라이더 값 강제 업데이트)
+def update_sliders():
+    ps = st.session_state['preset_select']
+    if ps in PRESETS:
+        vals = PRESETS[ps]
+        st.session_state['slider_mom'] = vals[0]
+        st.session_state['slider_liq'] = vals[1]
+        st.session_state['slider_vol'] = vals[2]
+        st.session_state['slider_risk'] = vals[3]
 
 with st.sidebar:
     st.info("대상: KOSPI/KOSDAQ 유동성 상위 200개")
@@ -411,22 +427,28 @@ with st.sidebar:
     mode = st.radio("모드 선택", ["📉 백테스트", "🔍 전략 최적화"], key="mode_radio")
     st.divider()
     
-    PRESETS = {
-        "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
-        "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🌊 세력주 포착": (0.4, 1.0, 0.2, 0.2),
-        "🏰 철벽 방어": (0.1, 0.1, 1.0, 1.0), "🧘 마음의 평화": (0.3, 0.2, 1.0, 0.5),
-        "🚑 좀비 헌터": (0.4, 0.3, 0.3, 1.0), "⚖️ 황금 밸런스": (0.5, 0.5, 0.5, 0.5),
-        "💎 우상향 정석": (0.7, 0.3, 0.7, 0.4), "🐆 안전한 사냥": (0.8, 0.7, 0.1, 0.8),
-        "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8), "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1), 
-        "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9), "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6), 
-        "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2), "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7)
-    }
-    sel_preset = st.selectbox("전략 프리셋", list(PRESETS.keys()), index=5, key="preset_select")
-    dw = PRESETS[sel_preset]
-    w_mom = st.slider("📈 추세", 0.0, 1.0, dw[0], 0.1, key="slider_mom")
-    w_liq = st.slider("🌊 수급", 0.0, 1.0, dw[1], 0.1, key="slider_liq")
-    w_vol = st.slider("⚖️ 저변동", 0.0, 1.0, dw[2], 0.1, key="slider_vol")
-    w_risk = st.slider("🛡️ 방어", 0.0, 1.0, dw[3], 0.1, key="slider_risk")
+    # Selectbox에 콜백 연결
+    sel_preset = st.selectbox(
+        "전략 프리셋", 
+        list(PRESETS.keys()), 
+        index=9, # '🐆 안전한 사냥'을 기본값으로
+        key="preset_select",
+        on_change=update_sliders # 핵심 수정
+    )
+    
+    # 슬라이더 초기값 세팅 (첫 실행 시 Safe Hunting 값으로)
+    if 'slider_mom' not in st.session_state:
+        # 안전한 사냥: (0.8, 0.7, 0.1, 0.8)
+        init_vals = PRESETS["🐆 안전한 사냥"]
+        st.session_state['slider_mom'] = init_vals[0]
+        st.session_state['slider_liq'] = init_vals[1]
+        st.session_state['slider_vol'] = init_vals[2]
+        st.session_state['slider_risk'] = init_vals[3]
+
+    w_mom = st.slider("📈 추세", 0.0, 1.0, key="slider_mom", step=0.1)
+    w_liq = st.slider("🌊 수급", 0.0, 1.0, key="slider_liq", step=0.1)
+    w_vol = st.slider("⚖️ 저변동", 0.0, 1.0, key="slider_vol", step=0.1)
+    w_risk = st.slider("🛡️ 방어", 0.0, 1.0, key="slider_risk", step=0.1)
     weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
 
 if mode == "📉 백테스트":
