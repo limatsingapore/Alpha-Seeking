@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v7.8)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v8.0)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -35,8 +35,8 @@ CONST = {
     'DEFAULT_START_DATE': datetime(2018, 1, 1),
     'RISK_FREE_RATE': 0.035,
     'COST_RATE': 0.002, 
-    'MIN_AMT': 5_000_000_000, # [복원] 최소 거래대금 50억 (절대 하한선)
-    'TOP_N': 20
+    'MIN_AMT': 5_000_000_000, # 최소 50억 (잡주 방지)
+    'TOP_N': 20 # 20개 고정
 }
 
 # ==============================================================================
@@ -56,9 +56,6 @@ def calculate_slippage(amount_traded, avg_daily_volume):
     elif participation_rate < 0.05: return 0.003 
     elif participation_rate < 0.10: return 0.005 
     else: return 0.01 
-
-def get_optimal_holdings(portfolio_size):
-    return CONST['TOP_N'] # 20개 고정
 
 def infer_sector_kr(name, code=None):
     exact_mapping = {
@@ -103,7 +100,7 @@ def load_kr_data():
         if 'Symbol' in df.columns: df.rename(columns={'Symbol':'Code'}, inplace=True)
         df = df[~df['Name'].str.contains('스팩|우B|우|리츠|홀딩스', na=False)]
         
-        # 유동성 상위 300개 확보 (검증 풀)
+        # 유동성 상위 300개 확보
         if 'Amount' in df.columns:
             df = df.sort_values('Amount', ascending=False).head(300) 
         elif 'Marcap' in df.columns:
@@ -134,7 +131,7 @@ def fetch_data_serial(universe, start_date, end_date):
     for i, code in enumerate(universe):
         try:
             d = fdr.DataReader(code, s_str, e_str)
-            # [복원] 최소 120일(약 6개월) 이상 데이터 존재해야 함 (신규 상장주 제외)
+            # 120일 이상 데이터 필수
             if len(d) > 120 and d['Close'].iloc[-1] > 0:
                 if 'Close' in d.columns: p_dict[code] = d['Close']
                 if 'Volume' in d.columns: v_dict[code] = d['Volume']
@@ -161,14 +158,12 @@ def fetch_data_serial(universe, start_date, end_date):
 # [Core Logic: 팩터 계산]
 # ==============================================================================
 def calculate_factors(price, volume, min_amt, trading_days=252):
-    # [복원] 팩터 계산 시에도 120일 데이터 확인
     if len(price) < 120 or price.iloc[-1] == 0 or np.isnan(price.iloc[-1]): return None
     try:
         p = price
         v = volume
         amt = p * v
         
-        # 거래대금 필터 (Backtest Loop에서 전달받은 동적 기준 적용)
         if amt.iloc[-20:].mean() < min_amt: return None
         
         mom_short = p.pct_change(20).iloc[-1]
@@ -223,15 +218,14 @@ def rank_and_score(factor_df, weights, ticker_map=None):
 # ==============================================================================
 # [백테스트 엔진]
 # ==============================================================================
-def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, initial_capital=100_000_000):
+def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
     if prices.empty: return pd.DataFrame()
     
     reb_dates = prices.resample('BM').last().index
     logs = []
     prev_picks = [] 
     
-    target_n = CONST['TOP_N'] # 20개
-    current_capital = initial_capital
+    target_n = CONST['TOP_N'] # 20개 고정
     
     if benchmark is None or benchmark.empty:
         benchmark = pd.Series(1.0, index=prices.index)
@@ -244,18 +238,12 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
         if i < len(reb_dates) - 1: next_rebal = reb_dates[i+1]
         else: next_rebal = prices.index[-1]
         
-        # 마지막 날짜 포함
+        # 데이터 끝까지 가도록 조건 완화
         if rebal_date > prices.index[-1]: break
             
         try:
-            # [수정] 거래대금 필터 강화 (절충안 적용)
-            # 1. 자본금 대비 30배 (슬리피지 방지)
-            # 2. 절대금액 50억 (잡주 방지)
-            # 둘 중 큰 값을 기준으로 함
-            min_trade_amt = max(
-                (current_capital / target_n) * 30, 
-                CONST['MIN_AMT']
-            )
+            # 거래대금 필터: 50억 고정 (단순화)
+            min_trade_amt = CONST['MIN_AMT']
             
             rebal_idx = prices.index.searchsorted(rebal_date)
             if rebal_idx <= 0: continue
@@ -271,6 +259,7 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
                 if f:
                     f['code'] = t; daily_factors.append(f)
             
+            # 종목 수가 적어도 진행
             if not daily_factors: continue 
             
             factor_df = pd.DataFrame(daily_factors).set_index('code')
@@ -303,7 +292,9 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
                 kept = set(prev_picks) & set(picks)
                 turnover = (denom - len(kept)) / denom
             
-            target_amt_per_stock = current_capital / len(picks) if picks else 0
+            # 슬리피지: 평균 거래대금 가정 (5천만원 투입 시)
+            assumed_capital = 100_000_000
+            target_amt_per_stock = assumed_capital / len(picks)
             
             s_costs = []
             for t in picks:
@@ -334,12 +325,9 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None, in
                 'Turnover': turnover,
                 'Holdings_List': picks, 
                 'Prices_Dict': current_prices, 
-                'Port_Ret': net_ret,
-                'Capital': current_capital 
+                'Port_Ret': net_ret
             })
             prev_picks = picks
-            
-            current_capital = current_capital * (1 + net_ret)
             
         except: continue
             
@@ -379,7 +367,7 @@ def calculate_metrics(res_df):
         'Win_Rate': (res_df['Port_Ret'] > 0).sum() / len(res_df)
     }
 
-def optimize_strategy(prices, volumes, ticker_map, presets, const, initial_capital):
+def optimize_strategy(prices, volumes, ticker_map, presets, const):
     results = []
     if prices.empty: return pd.DataFrame()
     prog = st.progress(0, text="시뮬레이션 시작...")
@@ -389,7 +377,7 @@ def optimize_strategy(prices, volumes, ticker_map, presets, const, initial_capit
     for i, (name, w) in enumerate(presets.items()):
         weights = {'mom': w[0], 'liq': w[1], 'vol': w[2], 'risk': w[3]}
         try:
-            res = run_backtest(prices, volumes, weights, ticker_map, const, benchmark=bm_series, initial_capital=initial_capital)
+            res = run_backtest(prices, volumes, weights, ticker_map, const, benchmark=bm_series)
             if not res.empty:
                 res = res.set_index('Sell_Date')
                 metrics = calculate_metrics(res)
@@ -406,7 +394,7 @@ def optimize_strategy(prices, volumes, ticker_map, presets, const, initial_capit
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v7.8)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v8.0)")
 
 PRESETS = {
     "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
@@ -430,7 +418,6 @@ def update_sliders():
 
 with st.sidebar:
     st.info("대상: KOSPI/KOSDAQ 유동성 상위 300개")
-    initial_cap = st.number_input("투자 원금 (원)", value=100_000_000, step=10_000_000, format="%d")
     TICKER_INFO, ALL_STOCKS = load_kr_data()
             
     if st.button("🧹 캐시 초기화", key="clear_cache"): st.cache_data.clear(); st.rerun()
@@ -442,16 +429,13 @@ with st.sidebar:
     sel_preset = st.selectbox(
         "전략 프리셋", 
         list(PRESETS.keys()), 
-        index=7, # '황금 밸런스'를 기본값으로
+        index=9, 
         key="preset_select",
         on_change=update_sliders 
     )
     
-    # [수정] 세션 상태 초기화 (현재 선택된 프리셋 값으로)
     if 'slider_mom' not in st.session_state:
-        # sel_preset(키)가 아직 session_state에 없을 수 있으므로 기본값 처리
-        default_preset = st.session_state.get('preset_select', "⚖️ 황금 밸런스")
-        init_vals = PRESETS[default_preset]
+        init_vals = PRESETS["🐆 안전한 사냥"]
         st.session_state['slider_mom'] = init_vals[0]
         st.session_state['slider_liq'] = init_vals[1]
         st.session_state['slider_vol'] = init_vals[2]
@@ -471,13 +455,13 @@ if mode == "📉 백테스트":
     if st.button("실행", type="primary", key="btn_run_backtest"):
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
         
-        st.success(f"데이터 수집 완료: 총 {len(p.columns)}개 종목 (기간: {p.index.min().date()} ~ {p.index.max().date()})")
+        st.success(f"데이터 수집 완료: 총 {len(p.columns)}개 종목")
         
         if not p.empty:
             main_bm = bms.get('KOSPI')
             if main_bm is None: main_bm = pd.Series(1.0, index=p.index)
             
-            res = run_backtest(p, v, weights, TICKER_INFO, CONST, benchmark=main_bm, initial_capital=initial_cap)
+            res = run_backtest(p, v, weights, TICKER_INFO, CONST, benchmark=main_bm)
             
             if not res.empty:
                 res_chart = res.set_index('Date')
@@ -555,7 +539,7 @@ elif mode == "🔍 전략 최적화":
                 if name == "사용자 정의": continue
                 
                 ws = {'mom': w[0], 'liq': w[1], 'vol': w[2], 'risk': w[3]}
-                res = run_backtest(p, v, ws, TICKER_INFO, CONST, benchmark=main_bm, initial_capital=initial_cap)
+                res = run_backtest(p, v, ws, TICKER_INFO, CONST, benchmark=main_bm)
                 
                 if not res.empty:
                     res_c = res.set_index('Sell_Date')
@@ -581,7 +565,7 @@ elif mode == "🔍 전략 최적화":
                 best_w_list = list(map(float, best_w_str.split('|')))
                 best_weights = {'mom': best_w_list[0], 'liq': best_w_list[1], 'vol': best_w_list[2], 'risk': best_w_list[3]}
                 
-                res_best = run_backtest(p, v, best_weights, TICKER_INFO, CONST, benchmark=main_bm, initial_capital=initial_cap)
+                res_best = run_backtest(p, v, best_weights, TICKER_INFO, CONST, benchmark=main_bm)
                 if not res_best.empty:
                     res_best = res_best.set_index('Date')
                     res_best['Cum'] = (1+res_best['Port_Ret']).cumprod()
