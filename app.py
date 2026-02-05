@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v8.0)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v8.1)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -35,8 +35,8 @@ CONST = {
     'DEFAULT_START_DATE': datetime(2018, 1, 1),
     'RISK_FREE_RATE': 0.035,
     'COST_RATE': 0.002, 
-    'MIN_AMT': 5_000_000_000, # 최소 50억 (잡주 방지)
-    'TOP_N': 20 # 20개 고정
+    'MIN_AMT': 5_000_000_000, 
+    'TOP_N': 20 
 }
 
 # ==============================================================================
@@ -100,7 +100,6 @@ def load_kr_data():
         if 'Symbol' in df.columns: df.rename(columns={'Symbol':'Code'}, inplace=True)
         df = df[~df['Name'].str.contains('스팩|우B|우|리츠|홀딩스', na=False)]
         
-        # 유동성 상위 300개 확보
         if 'Amount' in df.columns:
             df = df.sort_values('Amount', ascending=False).head(300) 
         elif 'Marcap' in df.columns:
@@ -131,7 +130,6 @@ def fetch_data_serial(universe, start_date, end_date):
     for i, code in enumerate(universe):
         try:
             d = fdr.DataReader(code, s_str, e_str)
-            # 120일 이상 데이터 필수
             if len(d) > 120 and d['Close'].iloc[-1] > 0:
                 if 'Close' in d.columns: p_dict[code] = d['Close']
                 if 'Volume' in d.columns: v_dict[code] = d['Volume']
@@ -155,7 +153,7 @@ def fetch_data_serial(universe, start_date, end_date):
     return df_p, df_v, bm_dict
 
 # ==============================================================================
-# [Core Logic: 팩터 계산]
+# [Core Logic]
 # ==============================================================================
 def calculate_factors(price, volume, min_amt, trading_days=252):
     if len(price) < 120 or price.iloc[-1] == 0 or np.isnan(price.iloc[-1]): return None
@@ -163,7 +161,6 @@ def calculate_factors(price, volume, min_amt, trading_days=252):
         p = price
         v = volume
         amt = p * v
-        
         if amt.iloc[-20:].mean() < min_amt: return None
         
         mom_short = p.pct_change(20).iloc[-1]
@@ -215,9 +212,6 @@ def rank_and_score(factor_df, weights, ticker_map=None):
     
     return scored.sort_values(by='Total_Score', ascending=False)
 
-# ==============================================================================
-# [백테스트 엔진]
-# ==============================================================================
 def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
     if prices.empty: return pd.DataFrame()
     
@@ -225,7 +219,7 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
     logs = []
     prev_picks = [] 
     
-    target_n = CONST['TOP_N'] # 20개 고정
+    target_n = CONST['TOP_N'] 
     
     if benchmark is None or benchmark.empty:
         benchmark = pd.Series(1.0, index=prices.index)
@@ -238,11 +232,9 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
         if i < len(reb_dates) - 1: next_rebal = reb_dates[i+1]
         else: next_rebal = prices.index[-1]
         
-        # 데이터 끝까지 가도록 조건 완화
         if rebal_date > prices.index[-1]: break
             
         try:
-            # 거래대금 필터: 50억 고정 (단순화)
             min_trade_amt = CONST['MIN_AMT']
             
             rebal_idx = prices.index.searchsorted(rebal_date)
@@ -259,7 +251,6 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
                 if f:
                     f['code'] = t; daily_factors.append(f)
             
-            # 종목 수가 적어도 진행
             if not daily_factors: continue 
             
             factor_df = pd.DataFrame(daily_factors).set_index('code')
@@ -292,7 +283,6 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
                 kept = set(prev_picks) & set(picks)
                 turnover = (denom - len(kept)) / denom
             
-            # 슬리피지: 평균 거래대금 가정 (5천만원 투입 시)
             assumed_capital = 100_000_000
             target_amt_per_stock = assumed_capital / len(picks)
             
@@ -394,7 +384,7 @@ def optimize_strategy(prices, volumes, ticker_map, presets, const):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v8.0)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v8.1)")
 
 PRESETS = {
     "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
@@ -415,6 +405,13 @@ def update_sliders():
         st.session_state['slider_liq'] = vals[1]
         st.session_state['slider_vol'] = vals[2]
         st.session_state['slider_risk'] = vals[3]
+
+# [수정] 날짜 선택 위젯을 사이드바 밖(최상단)으로 이동하여 모든 모드에서 접근 가능하게 변경
+c_d1, c_d2 = st.columns(2)
+with c_d1: 
+    s_d = st.date_input("분석 시작일", CONST['DEFAULT_START_DATE'], key="start_date_common")
+with c_d2: 
+    e_d = st.date_input("분석 종료일", get_last_complete_month_end(), key="end_date_common")
 
 with st.sidebar:
     st.info("대상: KOSPI/KOSDAQ 유동성 상위 300개")
@@ -448,10 +445,6 @@ with st.sidebar:
     weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
 
 if mode == "📉 백테스트":
-    c1, c2 = st.columns(2)
-    with c1: s_d = st.date_input("시작", CONST['DEFAULT_START_DATE'], key="start_date")
-    with c2: e_d = st.date_input("종료", get_last_complete_month_end(), key="end_date")
-    
     if st.button("실행", type="primary", key="btn_run_backtest"):
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
         
@@ -519,14 +512,14 @@ if mode == "📉 백테스트":
 
             else:
                 st.error("백테스트 결과가 없습니다.")
-                st.warning("팁: 유동성 필터(최소 거래대금) 조건이 너무 엄격할 수 있습니다.")
         else:
             st.error("데이터 수집 실패")
 
 elif mode == "🔍 전략 최적화":
-    st.info("전략별 성과를 비교합니다.")
-    if st.button("비교 시작", key="btn_run_opt"):
-        p, v, bms = fetch_data_serial(ALL_STOCKS, datetime(2018,1,1), datetime.now())
+    st.info("다양한 전략의 성과를 비교 분석합니다.")
+    if st.button("전략 비교 시작", key="btn_run_opt"):
+        # [수정] 사용자가 상단에서 선택한 s_d, e_d를 사용
+        p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
         
         if not p.empty:
             results = []
