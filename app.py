@@ -157,14 +157,31 @@ def fetch_data_serial(universe, start_date, end_date):
 # ==============================================================================
 # [Core Logic]
 # ==============================================================================
+# ==============================================================================
+# [Core Logic: 팩터 계산]
+# ==============================================================================
 def calculate_factors(price, volume, min_amt, trading_days=252):
+    # 1. 기본 데이터 길이 체크
     if len(price) < 120 or price.iloc[-1] == 0 or np.isnan(price.iloc[-1]): return None
+    
+    # -------------------------------------------------------------------------
+    # [추가된 로직] 거래정지 감지 필터 (Data Trap 방지)
+    # 최근 20 거래일 중 거래량이 0인 날이 3일 이상이면 '거래정지 위험 종목'으로 간주하고 탈락
+    # (현대무벡스 같은 케이스 방지)
+    # -------------------------------------------------------------------------
+    zero_volume_days = (volume.tail(20) == 0).sum()
+    if zero_volume_days >= 3:
+        return None 
+    # -------------------------------------------------------------------------
+
     try:
         p = price
         v = volume
         amt = p * v
-        if amt.iloc[-20:].mean() < min_amt: return None
         
+        # 2. 거래대금 필터 (기존 로직)
+        if amt.iloc[-20:].mean() < min_amt: return None
+            
         mom_short = p.pct_change(20).iloc[-1]
         mom_mid = p.pct_change(60).iloc[-1]
         vol = p.pct_change().tail(trading_days).std() * np.sqrt(trading_days)
