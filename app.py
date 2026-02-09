@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v8.1)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v8.2)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -21,6 +21,8 @@ st.markdown("""
     [data-testid="stMetricLabel"] { color: #94a3b8 !important; font-size: 0.8rem !important; }
     [data-testid="stMetricValue"] { color: #f8fafc !important; font-size: 1.1rem !important; }
     div[data-testid="stExpander"] { background-color: #1e293b; border-radius: 8px; }
+    /* 로딩바 겹침 방지를 위한 상단 여백 추가 */
+    .stProgress { margin-top: 20px; margin-bottom: 20px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -384,7 +386,7 @@ def optimize_strategy(prices, volumes, ticker_map, presets, const):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v8.1)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v8.2)")
 
 PRESETS = {
     "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
@@ -406,7 +408,6 @@ def update_sliders():
         st.session_state['slider_vol'] = vals[2]
         st.session_state['slider_risk'] = vals[3]
 
-# [수정] 날짜 선택 위젯을 사이드바 밖(최상단)으로 이동하여 모든 모드에서 접근 가능하게 변경
 c_d1, c_d2 = st.columns(2)
 with c_d1: 
     s_d = st.date_input("분석 시작일", CONST['DEFAULT_START_DATE'], key="start_date_common")
@@ -445,6 +446,7 @@ with st.sidebar:
     weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
 
 if mode == "📉 백테스트":
+    st.write("") # [수정] 상단 여백 추가 (로딩바 겹침 방지)
     if st.button("실행", type="primary", key="btn_run_backtest"):
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
         
@@ -503,12 +505,13 @@ if mode == "📉 백테스트":
                             "종목명": name,
                             "코드": c,
                             "섹터": sector,
-                            "매수가": f"{price:,.0f}원"
+                            "매수가(종가)": f"{price:,.0f}원"
                         })
                     
                     df_detail = pd.DataFrame(detail_data)
                     st.dataframe(df_detail, use_container_width=True)
-                    st.caption(f"※ 선정 기준일(T-1)의 데이터로 분석하여 {sel_date_str} 당일(T) 종가에 매수한 내역입니다.")
+                    # [수정] 안내 메시지 명확화
+                    st.caption(f"※ 선정 기준일(T-1)의 데이터로 분석하여, {sel_date_str} 당일(T) 종가에 매수한 내역입니다. (Standard Rebalancing Rule)")
 
             else:
                 st.error("백테스트 결과가 없습니다.")
@@ -517,8 +520,8 @@ if mode == "📉 백테스트":
 
 elif mode == "🔍 전략 최적화":
     st.info("다양한 전략의 성과를 비교 분석합니다.")
+    st.write("") 
     if st.button("전략 비교 시작", key="btn_run_opt"):
-        # [수정] 사용자가 상단에서 선택한 s_d, e_d를 사용
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
         
         if not p.empty:
