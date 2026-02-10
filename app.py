@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v8.2)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v8.4)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -21,7 +21,6 @@ st.markdown("""
     [data-testid="stMetricLabel"] { color: #94a3b8 !important; font-size: 0.8rem !important; }
     [data-testid="stMetricValue"] { color: #f8fafc !important; font-size: 1.1rem !important; }
     div[data-testid="stExpander"] { background-color: #1e293b; border-radius: 8px; }
-    /* 로딩바 겹침 방지를 위한 상단 여백 추가 */
     .stProgress { margin-top: 20px; margin-bottom: 20px; }
     </style>
     """, unsafe_allow_html=True)
@@ -39,6 +38,26 @@ CONST = {
     'COST_RATE': 0.002, 
     'MIN_AMT': 5_000_000_000, 
     'TOP_N': 20 
+}
+
+# ==============================================================================
+# [프리셋 정의]
+# ==============================================================================
+PRESETS = {
+    # 기존 프리셋
+    "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
+    "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🌊 세력주 포착": (0.4, 1.0, 0.2, 0.2),
+    "🏰 철벽 방어": (0.1, 0.1, 1.0, 1.0), "🧘 마음의 평화": (0.3, 0.2, 1.0, 0.5),
+    "🚑 좀비 헌터": (0.4, 0.3, 0.3, 1.0), "⚖️ 황금 밸런스": (0.5, 0.5, 0.5, 0.5),
+    "💎 우상향 정석": (0.7, 0.3, 0.7, 0.4), "🐆 안전한 사냥": (0.8, 0.7, 0.1, 0.8),
+    "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8), "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1), 
+    "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9), "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6), 
+    "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2), "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7),
+    
+    # [추가] 시장 상황별 최적화 프리셋
+    "📈 상승장 최적화": (0.9, 0.7, 0.0, 0.1),
+    "📉 하락장 최적화": (0.2, 0.3, 0.8, 0.9),
+    "🦀 횡보장 최적화": (0.5, 0.8, 0.4, 0.6)
 }
 
 # ==============================================================================
@@ -157,31 +176,19 @@ def fetch_data_serial(universe, start_date, end_date):
 # ==============================================================================
 # [Core Logic]
 # ==============================================================================
-# ==============================================================================
-# [Core Logic: 팩터 계산]
-# ==============================================================================
 def calculate_factors(price, volume, min_amt, trading_days=252):
-    # 1. 기본 데이터 길이 체크
     if len(price) < 120 or price.iloc[-1] == 0 or np.isnan(price.iloc[-1]): return None
     
-    # -------------------------------------------------------------------------
-    # [추가된 로직] 거래정지 감지 필터 (Data Trap 방지)
-    # 최근 20 거래일 중 거래량이 0인 날이 3일 이상이면 '거래정지 위험 종목'으로 간주하고 탈락
-    # (현대무벡스 같은 케이스 방지)
-    # -------------------------------------------------------------------------
+    # [거래정지 감지 필터]
     zero_volume_days = (volume.tail(20) == 0).sum()
-    if zero_volume_days >= 3:
-        return None 
-    # -------------------------------------------------------------------------
+    if zero_volume_days >= 3: return None 
 
     try:
         p = price
         v = volume
         amt = p * v
-        
-        # 2. 거래대금 필터 (기존 로직)
         if amt.iloc[-20:].mean() < min_amt: return None
-            
+        
         mom_short = p.pct_change(20).iloc[-1]
         mom_mid = p.pct_change(60).iloc[-1]
         vol = p.pct_change().tail(trading_days).std() * np.sqrt(trading_days)
@@ -231,13 +238,55 @@ def rank_and_score(factor_df, weights, ticker_map=None):
     
     return scored.sort_values(by='Total_Score', ascending=False)
 
-def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
+# ==============================================================================
+# [마켓 타이밍 로직]
+# ==============================================================================
+def get_market_adaptive_weights(strategy_mode, benchmark_series, current_date):
+    """
+    현재 날짜 기준으로 시장 상태를 판단하여 가중치를 반환
+    """
+    # 데이터 슬라이싱 (Look-ahead Bias 방지)
+    bm_slice = benchmark_series.loc[:current_date]
+    if len(bm_slice) < 120: 
+        # 데이터 부족 시 기본값 (안전한 사냥)
+        return PRESETS["🐆 안전한 사냥"]
+
+    # 1. 변동성 지표 (VIX) 기반
+    if strategy_mode == "VIX 변동성 스위칭":
+        # 최근 60일 연율화 변동성 계산
+        recent_vol = bm_slice.pct_change().tail(60).std() * np.sqrt(252) * 100
+        
+        if recent_vol < 15: # 안정장 -> 공격
+            return (0.9, 0.8, 0.0, 0.3) # Mom, Liq, Vol, Risk
+        elif recent_vol < 25: # 평온 -> 중립
+            return PRESETS["🐆 안전한 사냥"]
+        else: # 공포장 -> 방어
+            return (0.2, 0.3, 0.8, 0.9)
+
+    # 2. 추세 (Trend) 기반
+    elif strategy_mode == "Trend 추세 추종":
+        ma_20 = bm_slice.tail(20).mean()
+        ma_60 = bm_slice.tail(60).mean()
+        ma_120 = bm_slice.tail(120).mean()
+        
+        if ma_20 > ma_60 > ma_120: # 정배열 (대세 상승) -> 공격
+            return PRESETS["🌪️ 변동성 사냥꾼"]
+        elif ma_20 < ma_60 < ma_120: # 역배열 (대세 하락) -> 방어
+            return PRESETS["🏰 철벽 방어"]
+        else: # 혼조세
+            return PRESETS["🐆 안전한 사냥"]
+            
+    return PRESETS["⚖️ 황금 밸런스"] # Default
+
+# ==============================================================================
+# [백테스트 엔진 Update]
+# ==============================================================================
+def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=None, strategy_mode="Fixed"):
     if prices.empty: return pd.DataFrame()
     
     reb_dates = prices.resample('BM').last().index
     logs = []
     prev_picks = [] 
-    
     target_n = CONST['TOP_N'] 
     
     if benchmark is None or benchmark.empty:
@@ -247,15 +296,21 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
 
     for i in range(12, len(reb_dates)):
         rebal_date = reb_dates[i] 
-        
         if i < len(reb_dates) - 1: next_rebal = reb_dates[i+1]
         else: next_rebal = prices.index[-1]
-        
         if rebal_date > prices.index[-1]: break
             
         try:
+            # [마켓 타이밍 적용]
+            if strategy_mode in ["VIX 변동성 스위칭", "Trend 추세 추종"]:
+                # T-1일 기준으로 시장 판단
+                decision_date = prices.index[prices.index.searchsorted(rebal_date) - 1]
+                w_tuple = get_market_adaptive_weights(strategy_mode, benchmark, decision_date)
+                current_weights = {'mom': w_tuple[0], 'liq': w_tuple[1], 'vol': w_tuple[2], 'risk': w_tuple[3]}
+            else:
+                current_weights = initial_weights # 고정 가중치
+
             min_trade_amt = CONST['MIN_AMT']
-            
             rebal_idx = prices.index.searchsorted(rebal_date)
             if rebal_idx <= 0: continue
             selection_date = prices.index[rebal_idx - 1]
@@ -273,7 +328,7 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
             if not daily_factors: continue 
             
             factor_df = pd.DataFrame(daily_factors).set_index('code')
-            ranked = rank_and_score(factor_df, weights, ticker_map=ticker_map)
+            ranked = rank_and_score(factor_df, current_weights, ticker_map=ticker_map)
             
             picks = ranked.head(target_n).index.tolist()
             if not picks: continue
@@ -334,7 +389,8 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
                 'Turnover': turnover,
                 'Holdings_List': picks, 
                 'Prices_Dict': current_prices, 
-                'Port_Ret': net_ret
+                'Port_Ret': net_ret,
+                'Used_Weights': current_weights # 기록용
             })
             prev_picks = picks
             
@@ -376,45 +432,10 @@ def calculate_metrics(res_df):
         'Win_Rate': (res_df['Port_Ret'] > 0).sum() / len(res_df)
     }
 
-def optimize_strategy(prices, volumes, ticker_map, presets, const):
-    results = []
-    if prices.empty: return pd.DataFrame()
-    prog = st.progress(0, text="시뮬레이션 시작...")
-    
-    bm_series = pd.Series(1.0, index=prices.index) 
-    
-    for i, (name, w) in enumerate(presets.items()):
-        weights = {'mom': w[0], 'liq': w[1], 'vol': w[2], 'risk': w[3]}
-        try:
-            res = run_backtest(prices, volumes, weights, ticker_map, const, benchmark=bm_series)
-            if not res.empty:
-                res = res.set_index('Sell_Date')
-                metrics = calculate_metrics(res)
-                metrics['전략명'] = name
-                metrics['가중치'] = f"{w[0]}|{w[1]}|{w[2]}|{w[3]}"
-                results.append(metrics)
-        except: pass
-        prog.progress((i+1)/len(presets), text=f"분석 중: {name}")
-    
-    prog.empty()
-    if not results: return pd.DataFrame()
-    return pd.DataFrame(results).sort_values('CAGR', ascending=False)
-
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v8.2)")
-
-PRESETS = {
-    "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
-    "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🌊 세력주 포착": (0.4, 1.0, 0.2, 0.2),
-    "🏰 철벽 방어": (0.1, 0.1, 1.0, 1.0), "🧘 마음의 평화": (0.3, 0.2, 1.0, 0.5),
-    "🚑 좀비 헌터": (0.4, 0.3, 0.3, 1.0), "⚖️ 황금 밸런스": (0.5, 0.5, 0.5, 0.5),
-    "💎 우상향 정석": (0.7, 0.3, 0.7, 0.4), "🐆 안전한 사냥": (0.8, 0.7, 0.1, 0.8),
-    "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8), "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1), 
-    "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9), "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6), 
-    "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2), "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7)
-}
+st.title("🇰🇷 Alpha Seeking Pro (Final v8.4)")
 
 def update_sliders():
     ps = st.session_state['preset_select']
@@ -441,99 +462,117 @@ with st.sidebar:
     mode = st.radio("모드 선택", ["📉 백테스트", "🔍 전략 최적화"], key="mode_radio")
     st.divider()
     
-    sel_preset = st.selectbox(
-        "전략 프리셋", 
-        list(PRESETS.keys()), 
-        index=9, 
-        key="preset_select",
-        on_change=update_sliders 
-    )
-    
-    if 'slider_mom' not in st.session_state:
-        init_vals = PRESETS["🐆 안전한 사냥"]
-        st.session_state['slider_mom'] = init_vals[0]
-        st.session_state['slider_liq'] = init_vals[1]
-        st.session_state['slider_vol'] = init_vals[2]
-        st.session_state['slider_risk'] = init_vals[3]
+    # [모드에 따른 사이드바 UI 분기]
+    if mode == "📉 백테스트":
+        strategy_type = st.radio("전략 방식", ["고정 가중치 (Fixed)", "VIX 변동성 스위칭", "Trend 추세 추종"])
+        
+        if strategy_type == "고정 가중치 (Fixed)":
+            sel_preset = st.selectbox("전략 프리셋", list(PRESETS.keys()), index=9, key="preset_select", on_change=update_sliders)
+            
+            if 'slider_mom' not in st.session_state:
+                init_vals = PRESETS["🐆 안전한 사냥"]
+                st.session_state['slider_mom'] = init_vals[0]
+                st.session_state['slider_liq'] = init_vals[1]
+                st.session_state['slider_vol'] = init_vals[2]
+                st.session_state['slider_risk'] = init_vals[3]
 
-    w_mom = st.slider("📈 추세", 0.0, 1.0, key="slider_mom", step=0.1)
-    w_liq = st.slider("🌊 수급", 0.0, 1.0, key="slider_liq", step=0.1)
-    w_vol = st.slider("⚖️ 저변동", 0.0, 1.0, key="slider_vol", step=0.1)
-    w_risk = st.slider("🛡️ 방어", 0.0, 1.0, key="slider_risk", step=0.1)
-    weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
+            w_mom = st.slider("📈 추세", 0.0, 1.0, key="slider_mom", step=0.1)
+            w_liq = st.slider("🌊 수급", 0.0, 1.0, key="slider_liq", step=0.1)
+            w_vol = st.slider("⚖️ 저변동", 0.0, 1.0, key="slider_vol", step=0.1)
+            w_risk = st.slider("🛡️ 방어", 0.0, 1.0, key="slider_risk", step=0.1)
+            weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
+        else:
+            st.info(f"💡 시장 상황(KOSPI)에 따라\n매월 전략을 자동으로 변경합니다.\n\n선택 모드: {strategy_type}")
+            weights = None # 동적 모드에서는 초기 웨이트 무시
+    else:
+        # 최적화 모드에서는 웨이트 설정 불필요
+        strategy_type = "Fixed"
+        weights = None
 
 if mode == "📉 백테스트":
-    st.write("") # [수정] 상단 여백 추가 (로딩바 겹침 방지)
+    st.write("") 
     if st.button("실행", type="primary", key="btn_run_backtest"):
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
-        
         st.success(f"데이터 수집 완료: 총 {len(p.columns)}개 종목")
         
         if not p.empty:
             main_bm = bms.get('KOSPI')
             if main_bm is None: main_bm = pd.Series(1.0, index=p.index)
             
-            res = run_backtest(p, v, weights, TICKER_INFO, CONST, benchmark=main_bm)
+            # 전략 모드 전달
+            res = run_backtest(p, v, weights, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode=strategy_type)
             
-            if not res.empty:
-                res_chart = res.set_index('Date')
-                res_chart['Cum'] = (1+res_chart['Port_Ret']).cumprod()
-                
-                mets = calculate_metrics(res_chart)
-                
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("CAGR", f"{mets['CAGR']:.1%}")
-                m2.metric("MDD", f"{mets['MDD']:.1%}")
-                m3.metric("Sharpe", f"{mets['Sharpe']:.2f}")
-                m4.metric("Sortino", f"{mets['Sortino']:.2f}")
-                m5.metric("Win Rate", f"{mets['Win_Rate']:.1%}")
-                
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=res_chart.index, y=res_chart['Cum'], name="Strategy", line=dict(width=3, color='blue')))
-                
-                if 'KOSPI' in bms:
-                    try:
-                        b = bms['KOSPI'].reindex(res_chart.index, method='ffill')
-                        b = b / b.iloc[0]
-                        fig.add_trace(go.Scatter(x=b.index, y=b, name='KOSPI', line=dict(dash='dot', color='red')))
-                    except: pass
-                    
-                st.plotly_chart(fig, use_container_width=True)
-                
-                st.divider()
-                st.subheader("📅 월별 포트폴리오 상세 분석")
-                
-                date_options = res['Date'].dt.strftime('%Y-%m-%d').tolist()
-                sel_date_str = st.selectbox("매수 시점 선택", date_options[::-1], index=0)
-                
-                if sel_date_str:
-                    sel_date = pd.to_datetime(sel_date_str)
-                    row = res[res['Date'] == sel_date].iloc[0]
-                    
-                    codes = row['Holdings_List']
-                    prices_dict = row['Prices_Dict']
-                    
-                    detail_data = []
-                    for c in codes:
-                        name = TICKER_INFO.get(c, c)
-                        sector = infer_sector_kr(name, c) 
-                        price = prices_dict.get(c, 0)
-                        detail_data.append({
-                            "종목명": name,
-                            "코드": c,
-                            "섹터": sector,
-                            "매수가(종가)": f"{price:,.0f}원"
-                        })
-                    
-                    df_detail = pd.DataFrame(detail_data)
-                    st.dataframe(df_detail, use_container_width=True)
-                    # [수정] 안내 메시지 명확화
-                    st.caption(f"※ 선정 기준일(T-1)의 데이터로 분석하여, {sel_date_str} 당일(T) 종가에 매수한 내역입니다. (Standard Rebalancing Rule)")
-
-            else:
-                st.error("백테스트 결과가 없습니다.")
+            st.session_state['bt_p'] = p
+            st.session_state['bt_bms'] = bms
+            st.session_state['bt_res'] = res
+            st.session_state['bt_ran'] = True
         else:
             st.error("데이터 수집 실패")
+
+    if st.session_state.get('bt_ran'):
+        res = st.session_state['bt_res']
+        bms = st.session_state.get('bt_bms', {})
+        
+        if not res.empty:
+            res_chart = res.set_index('Date')
+            res_chart['Cum'] = (1+res_chart['Port_Ret']).cumprod()
+            
+            mets = calculate_metrics(res_chart)
+            
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("CAGR", f"{mets['CAGR']:.1%}")
+            m2.metric("MDD", f"{mets['MDD']:.1%}")
+            m3.metric("Sharpe", f"{mets['Sharpe']:.2f}")
+            m4.metric("Sortino", f"{mets['Sortino']:.2f}")
+            m5.metric("Win Rate", f"{mets['Win_Rate']:.1%}")
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=res_chart.index, y=res_chart['Cum'], name="Strategy", line=dict(width=3, color='blue')))
+            
+            if 'KOSPI' in bms:
+                try:
+                    b = bms['KOSPI'].reindex(res_chart.index, method='ffill')
+                    b = b / b.iloc[0]
+                    fig.add_trace(go.Scatter(x=b.index, y=b, name='KOSPI', line=dict(dash='dot', color='red')))
+                except: pass
+                
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.divider()
+            st.subheader("📅 월별 포트폴리오 상세 분석")
+            
+            date_options = res['Date'].dt.strftime('%Y-%m-%d').tolist()
+            sel_date_str = st.selectbox("매수 시점 선택", date_options[::-1], index=0)
+            
+            if sel_date_str:
+                sel_date = pd.to_datetime(sel_date_str)
+                row = res[res['Date'] == sel_date].iloc[0]
+                
+                codes = row['Holdings_List']
+                prices_dict = row['Prices_Dict']
+                
+                # [추가] 해당 월 적용 전략 표시 (동적 모드일 경우)
+                if 'Used_Weights' in row:
+                    w = row['Used_Weights']
+                    st.info(f"📌 적용 가중치: 추세 {w['mom']} | 수급 {w['liq']} | 저변동 {w['vol']} | 방어 {w['risk']}")
+
+                detail_data = []
+                for c in codes:
+                    name = TICKER_INFO.get(c, c)
+                    sector = infer_sector_kr(name, c) 
+                    price = prices_dict.get(c, 0)
+                    detail_data.append({
+                        "종목명": name,
+                        "코드": c,
+                        "섹터": sector,
+                        "매수가(종가)": f"{price:,.0f}원"
+                    })
+                
+                df_detail = pd.DataFrame(detail_data)
+                st.dataframe(df_detail, use_container_width=True)
+                st.caption(f"※ 선정 기준일(T-1)의 데이터로 분석하여, {sel_date_str} 당일(T) 종가에 매수한 내역입니다. (Standard Rebalancing Rule)")
+        else:
+            st.warning("결과 없음 (조건에 맞는 종목이 없습니다)")
 
 elif mode == "🔍 전략 최적화":
     st.info("다양한 전략의 성과를 비교 분석합니다.")
@@ -552,7 +591,7 @@ elif mode == "🔍 전략 최적화":
                 if name == "사용자 정의": continue
                 
                 ws = {'mom': w[0], 'liq': w[1], 'vol': w[2], 'risk': w[3]}
-                res = run_backtest(p, v, ws, TICKER_INFO, CONST, benchmark=main_bm)
+                res = run_backtest(p, v, ws, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="Fixed")
                 
                 if not res.empty:
                     res_c = res.set_index('Sell_Date')
@@ -578,7 +617,7 @@ elif mode == "🔍 전략 최적화":
                 best_w_list = list(map(float, best_w_str.split('|')))
                 best_weights = {'mom': best_w_list[0], 'liq': best_w_list[1], 'vol': best_w_list[2], 'risk': best_w_list[3]}
                 
-                res_best = run_backtest(p, v, best_weights, TICKER_INFO, CONST, benchmark=main_bm)
+                res_best = run_backtest(p, v, best_weights, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="Fixed")
                 if not res_best.empty:
                     res_best = res_best.set_index('Date')
                     res_best['Cum'] = (1+res_best['Port_Ret']).cumprod()
