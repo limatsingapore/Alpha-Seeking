@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v8.4)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v8.5)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -44,7 +44,6 @@ CONST = {
 # [프리셋 정의]
 # ==============================================================================
 PRESETS = {
-    # 기존 프리셋
     "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
     "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🌊 세력주 포착": (0.4, 1.0, 0.2, 0.2),
     "🏰 철벽 방어": (0.1, 0.1, 1.0, 1.0), "🧘 마음의 평화": (0.3, 0.2, 1.0, 0.5),
@@ -179,7 +178,6 @@ def fetch_data_serial(universe, start_date, end_date):
 def calculate_factors(price, volume, min_amt, trading_days=252):
     if len(price) < 120 or price.iloc[-1] == 0 or np.isnan(price.iloc[-1]): return None
     
-    # [거래정지 감지 필터]
     zero_volume_days = (volume.tail(20) == 0).sum()
     if zero_volume_days >= 3: return None 
 
@@ -239,54 +237,93 @@ def rank_and_score(factor_df, weights, ticker_map=None):
     return scored.sort_values(by='Total_Score', ascending=False)
 
 # ==============================================================================
-# [마켓 타이밍 로직]
+# [마켓 타이밍 로직 (고도화)]
 # ==============================================================================
-def get_market_adaptive_weights(strategy_mode, benchmark_series, current_date):
+def get_market_adaptive_weights(strategy_mode, benchmark_series, current_date, prev_weights=None):
     """
-    현재 날짜 기준으로 시장 상태를 판단하여 가중치를 반환
+    관성 효과와 정교한 추세 판단을 포함한 마켓 타이밍 엔진
     """
-    # 데이터 슬라이싱 (Look-ahead Bias 방지)
     bm_slice = benchmark_series.loc[:current_date]
-    if len(bm_slice) < 120: 
-        # 데이터 부족 시 기본값 (안전한 사냥)
-        return PRESETS["🐆 안전한 사냥"]
+    
+    # 1. 초기 데이터 부족 처리
+    if len(bm_slice) < 120:
+        if len(bm_slice) >= 60:
+            pass # 60일 이상이면 VIX 계산 가능하므로 진행
+        else:
+            return PRESETS["⚖️ 황금 밸런스"] # 정말 초기엔 균형
 
-    # 1. 변동성 지표 (VIX) 기반
+    # 지표 계산
+    recent_vol = bm_slice.pct_change().tail(60).std() * np.sqrt(252) * 100 # VIX
+    
+    ma_20 = bm_slice.tail(20).mean()
+    ma_60 = bm_slice.tail(60).mean()
+    ma_120 = bm_slice.tail(120).mean()
+    current_price = bm_slice.iloc[-1]
+    
+    # 추세 강도 점수 (Trend Score): 장기 이평선 대비 이격도
+    trend_score = (current_price - ma_120) / ma_120 * 100 if ma_120 > 0 else 0
+
+    # -----------------------------------------------------
+    # Mode 1: VIX 변동성 스위칭 (Inertia 적용)
+    # -----------------------------------------------------
     if strategy_mode == "VIX 변동성 스위칭":
-        # 최근 60일 연율화 변동성 계산
-        recent_vol = bm_slice.pct_change().tail(60).std() * np.sqrt(252) * 100
-        
-        if recent_vol < 15: # 안정장 -> 공격
-            return (0.9, 0.8, 0.0, 0.3) # Mom, Liq, Vol, Risk
-        elif recent_vol < 25: # 평온 -> 중립
+        # 버퍼존 (13~17): 기존 전략 유지 (잦은 매매 방지)
+        if prev_weights is not None and 13 < recent_vol < 17:
+            return prev_weights
+            
+        if recent_vol < 15: # 안정장
+            return (0.9, 0.8, 0.0, 0.3) 
+        elif recent_vol < 25: # 정상장
             return PRESETS["🐆 안전한 사냥"]
-        else: # 공포장 -> 방어
+        else: # 공포장
             return (0.2, 0.3, 0.8, 0.9)
 
-    # 2. 추세 (Trend) 기반
+    # -----------------------------------------------------
+    # Mode 2: Trend 추세 추종 (정교화)
+    # -----------------------------------------------------
     elif strategy_mode == "Trend 추세 추종":
-        ma_20 = bm_slice.tail(20).mean()
-        ma_60 = bm_slice.tail(60).mean()
-        ma_120 = bm_slice.tail(120).mean()
-        
-        if ma_20 > ma_60 > ma_120: # 정배열 (대세 상승) -> 공격
+        if ma_20 > ma_60 > ma_120 and trend_score > 0: # 확고한 상승
             return PRESETS["🌪️ 변동성 사냥꾼"]
-        elif ma_20 < ma_60 < ma_120: # 역배열 (대세 하락) -> 방어
+        elif ma_20 < ma_60 < ma_120 and trend_score < -5: # 확고한 하락
             return PRESETS["🏰 철벽 방어"]
-        else: # 혼조세
+        elif abs(trend_score) < 3: # 횡보장 (박스권)
+            return PRESETS["🌊 세력주 포착"] # 수급 위주
+        else:
             return PRESETS["🐆 안전한 사냥"]
-            
-    return PRESETS["⚖️ 황금 밸런스"] # Default
+
+    # -----------------------------------------------------
+    # Mode 3: Hybrid (VIX + Trend)
+    # -----------------------------------------------------
+    elif strategy_mode == "Hybrid (VIX+Trend)":
+        # VIX Signal (-1:방어, 0:중립, 1:공격)
+        vix_signal = 0
+        if recent_vol < 15: vix_signal = 1
+        elif recent_vol > 25: vix_signal = -1
+        
+        # Trend Signal
+        trend_signal = 0
+        if ma_20 > ma_60 > ma_120 and trend_score > 0: trend_signal = 1
+        elif ma_20 < ma_60 < ma_120 and trend_score < -5: trend_signal = -1
+        
+        combined = (vix_signal + trend_signal) / 2
+        
+        if combined > 0.5: return PRESETS["🌪️ 변동성 사냥꾼"]
+        elif combined < -0.5: return PRESETS["🏰 철벽 방어"]
+        else: return PRESETS["🐆 안전한 사냥"]
+
+    return PRESETS["⚖️ 황금 밸런스"]
 
 # ==============================================================================
-# [백테스트 엔진 Update]
+# [백테스트 엔진]
 # ==============================================================================
 def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=None, strategy_mode="Fixed"):
     if prices.empty: return pd.DataFrame()
     
     reb_dates = prices.resample('BM').last().index
     logs = []
-    prev_picks = [] 
+    
+    # [추가] 이전 달 가중치 추적용 변수
+    prev_weights = None
     target_n = CONST['TOP_N'] 
     
     if benchmark is None or benchmark.empty:
@@ -301,14 +338,17 @@ def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=
         if rebal_date > prices.index[-1]: break
             
         try:
-            # [마켓 타이밍 적용]
-            if strategy_mode in ["VIX 변동성 스위칭", "Trend 추세 추종"]:
-                # T-1일 기준으로 시장 판단
+            # [전략 결정]
+            if strategy_mode in ["VIX 변동성 스위칭", "Trend 추세 추종", "Hybrid (VIX+Trend)"]:
+                # T-1일 기준 판단
                 decision_date = prices.index[prices.index.searchsorted(rebal_date) - 1]
-                w_tuple = get_market_adaptive_weights(strategy_mode, benchmark, decision_date)
+                w_tuple = get_market_adaptive_weights(strategy_mode, benchmark, decision_date, prev_weights)
                 current_weights = {'mom': w_tuple[0], 'liq': w_tuple[1], 'vol': w_tuple[2], 'risk': w_tuple[3]}
+                
+                # 다음 달을 위해 저장 (관성 효과용)
+                prev_weights = w_tuple
             else:
-                current_weights = initial_weights # 고정 가중치
+                current_weights = initial_weights
 
             min_trade_amt = CONST['MIN_AMT']
             rebal_idx = prices.index.searchsorted(rebal_date)
@@ -351,12 +391,6 @@ def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=
             ret_vec = ret_vec.fillna(0)
             gross_ret = ret_vec.mean()
             
-            if not prev_picks: turnover = 1.0
-            else:
-                denom = len(picks)
-                kept = set(prev_picks) & set(picks)
-                turnover = (denom - len(kept)) / denom
-            
             assumed_capital = 100_000_000
             target_amt_per_stock = assumed_capital / len(picks)
             
@@ -369,7 +403,7 @@ def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=
                     s_costs.append(calculate_slippage(target_amt_per_stock, avg_v))
             avg_slippage = np.mean(s_costs) if s_costs else 0.002
             
-            total_cost = (const['COST_RATE'] + avg_slippage) * turnover
+            total_cost = (CONST['COST_RATE'] + avg_slippage)
             net_ret = gross_ret - total_cost
             
             try:
@@ -386,13 +420,11 @@ def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=
                 'Gross_Ret': gross_ret, 
                 'Net_Ret': net_ret,
                 'BM_Ret': bm_ret, 
-                'Turnover': turnover,
                 'Holdings_List': picks, 
                 'Prices_Dict': current_prices, 
                 'Port_Ret': net_ret,
-                'Used_Weights': current_weights # 기록용
+                'Used_Weights': current_weights # 기록
             })
-            prev_picks = picks
             
         except: continue
             
@@ -435,7 +467,7 @@ def calculate_metrics(res_df):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v8.4)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v8.5)")
 
 def update_sliders():
     ps = st.session_state['preset_select']
@@ -462,9 +494,9 @@ with st.sidebar:
     mode = st.radio("모드 선택", ["📉 백테스트", "🔍 전략 최적화"], key="mode_radio")
     st.divider()
     
-    # [모드에 따른 사이드바 UI 분기]
     if mode == "📉 백테스트":
-        strategy_type = st.radio("전략 방식", ["고정 가중치 (Fixed)", "VIX 변동성 스위칭", "Trend 추세 추종"])
+        # 4가지 모드 제공
+        strategy_type = st.radio("전략 운용 방식", ["고정 가중치 (Fixed)", "VIX 변동성 스위칭", "Trend 추세 추종", "Hybrid (VIX+Trend)"])
         
         if strategy_type == "고정 가중치 (Fixed)":
             sel_preset = st.selectbox("전략 프리셋", list(PRESETS.keys()), index=9, key="preset_select", on_change=update_sliders)
@@ -482,16 +514,22 @@ with st.sidebar:
             w_risk = st.slider("🛡️ 방어", 0.0, 1.0, key="slider_risk", step=0.1)
             weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
         else:
-            st.info(f"💡 시장 상황(KOSPI)에 따라\n매월 전략을 자동으로 변경합니다.\n\n선택 모드: {strategy_type}")
-            weights = None # 동적 모드에서는 초기 웨이트 무시
+            st.info(f"💡 시장(KOSPI) 상황에 맞춰\n매월 최적의 전략으로 자동 전환합니다.\n\n선택 모드: {strategy_type}")
+            weights = None 
     else:
-        # 최적화 모드에서는 웨이트 설정 불필요
         strategy_type = "Fixed"
         weights = None
 
 if mode == "📉 백테스트":
     st.write("") 
-    if st.button("실행", type="primary", key="btn_run_backtest"):
+    # [기능 추가] 전체 전략 비교 실행 버튼
+    c_btn1, c_btn2 = st.columns([1, 1])
+    with c_btn1:
+        run_single = st.button("현재 설정으로 실행", type="primary", key="btn_run_single")
+    with c_btn2:
+        run_compare = st.button("⚡ 4개 모드 동시 비교", key="btn_run_compare")
+
+    if run_single:
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
         st.success(f"데이터 수집 완료: 총 {len(p.columns)}개 종목")
         
@@ -499,17 +537,68 @@ if mode == "📉 백테스트":
             main_bm = bms.get('KOSPI')
             if main_bm is None: main_bm = pd.Series(1.0, index=p.index)
             
-            # 전략 모드 전달
             res = run_backtest(p, v, weights, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode=strategy_type)
             
             st.session_state['bt_p'] = p
             st.session_state['bt_bms'] = bms
             st.session_state['bt_res'] = res
             st.session_state['bt_ran'] = True
+            st.session_state['bt_mode'] = 'single'
         else:
             st.error("데이터 수집 실패")
 
+    elif run_compare:
+        p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
+        st.success(f"데이터 수집 완료: 비교 분석 시작...")
+        
+        if not p.empty:
+            main_bm = bms.get('KOSPI')
+            if main_bm is None: main_bm = pd.Series(1.0, index=p.index)
+            
+            comp_results = []
+            # 1. 고정 (안전한 사냥 기준)
+            res_fixed = run_backtest(p, v, PRESETS["🐆 안전한 사냥"], TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="Fixed")
+            if not res_fixed.empty: 
+                m = calculate_metrics(res_fixed.set_index('Sell_Date'))
+                m['전략'] = "고정 (안전한 사냥)"
+                comp_results.append(m)
+            
+            # 2. VIX
+            res_vix = run_backtest(p, v, None, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="VIX 변동성 스위칭")
+            if not res_vix.empty:
+                m = calculate_metrics(res_vix.set_index('Sell_Date'))
+                m['전략'] = "VIX 변동성 스위칭"
+                comp_results.append(m)
+                
+            # 3. Trend
+            res_trend = run_backtest(p, v, None, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="Trend 추세 추종")
+            if not res_trend.empty:
+                m = calculate_metrics(res_trend.set_index('Sell_Date'))
+                m['전략'] = "Trend 추세 추종"
+                comp_results.append(m)
+
+            # 4. Hybrid
+            res_hybrid = run_backtest(p, v, None, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="Hybrid (VIX+Trend)")
+            if not res_hybrid.empty:
+                m = calculate_metrics(res_hybrid.set_index('Sell_Date'))
+                m['전략'] = "Hybrid (VIX+Trend)"
+                comp_results.append(m)
+            
+            st.session_state['comp_results'] = pd.DataFrame(comp_results).sort_values('CAGR', ascending=False)
+            st.session_state['bt_res'] = res_hybrid # 차트는 하이브리드 기준으로 보여줌
+            st.session_state['bt_p'] = p
+            st.session_state['bt_bms'] = bms
+            st.session_state['bt_ran'] = True
+            st.session_state['bt_mode'] = 'compare'
+
+    # 결과 표시 로직
     if st.session_state.get('bt_ran'):
+        if st.session_state.get('bt_mode') == 'compare':
+            st.subheader("📊 전략 모드별 성과 비교")
+            st.dataframe(st.session_state['comp_results'].style.format("{:.1%}", subset=['CAGR','MDD','Win_Rate','Alpha']))
+            st.caption("※ 고정 전략은 '안전한 사냥' 프리셋을 기준으로 비교했습니다.")
+            st.divider()
+
         res = st.session_state['bt_res']
         bms = st.session_state.get('bt_bms', {})
         
@@ -517,62 +606,70 @@ if mode == "📉 백테스트":
             res_chart = res.set_index('Date')
             res_chart['Cum'] = (1+res_chart['Port_Ret']).cumprod()
             
-            mets = calculate_metrics(res_chart)
-            
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("CAGR", f"{mets['CAGR']:.1%}")
-            m2.metric("MDD", f"{mets['MDD']:.1%}")
-            m3.metric("Sharpe", f"{mets['Sharpe']:.2f}")
-            m4.metric("Sortino", f"{mets['Sortino']:.2f}")
-            m5.metric("Win Rate", f"{mets['Win_Rate']:.1%}")
+            if st.session_state.get('bt_mode') == 'single':
+                mets = calculate_metrics(res_chart)
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("CAGR", f"{mets['CAGR']:.1%}")
+                m2.metric("MDD", f"{mets['MDD']:.1%}")
+                m3.metric("Sharpe", f"{mets['Sharpe']:.2f}")
+                m4.metric("Sortino", f"{mets['Sortino']:.2f}")
+                m5.metric("Win Rate", f"{mets['Win_Rate']:.1%}")
             
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=res_chart.index, y=res_chart['Cum'], name="Strategy", line=dict(width=3, color='blue')))
-            
+            fig.add_trace(go.Scatter(x=res_chart.index, y=res_chart['Cum'], name="Port", line=dict(width=3, color='blue')))
             if 'KOSPI' in bms:
-                try:
-                    b = bms['KOSPI'].reindex(res_chart.index, method='ffill')
-                    b = b / b.iloc[0]
-                    fig.add_trace(go.Scatter(x=b.index, y=b, name='KOSPI', line=dict(dash='dot', color='red')))
-                except: pass
-                
+                b = bms['KOSPI'].reindex(res_chart.index, method='ffill')
+                b = b / b.iloc[0]
+                fig.add_trace(go.Scatter(x=b.index, y=b, name='KOSPI', line=dict(dash='dot', color='red')))
             st.plotly_chart(fig, use_container_width=True)
             
+            # [추가] 극단적 상황 시뮬레이션 분석 (결과가 있을 때만)
+            with st.expander("🔍 위기 대응 분석 (Historical Check)"):
+                st.write("주요 위기 상황에서 AI가 어떤 전략을 선택했는지 확인합니다.")
+                
+                # 2020 코로나 팬데믹
+                covid_mask = (res['Date'] >= '2020-02-01') & (res['Date'] <= '2020-04-30')
+                if covid_mask.any():
+                    st.markdown("**1. 코로나 팬데믹 (2020.02 ~ 04)**")
+                    covid_data = res.loc[covid_mask, ['Date', 'Used_Weights']].copy()
+                    # 가중치 딕셔너리를 보기 좋게 변환
+                    covid_data['전략'] = covid_data['Used_Weights'].apply(
+                        lambda w: "공격형" if w['mom']>0.8 else ("방어형" if w['risk']>0.8 else "중립/균형")
+                    )
+                    st.dataframe(covid_data[['Date', '전략']], use_container_width=True)
+                
+                # 2022 하락장
+                bear_mask = (res['Date'] >= '2022-01-01') & (res['Date'] <= '2022-12-31')
+                if bear_mask.any():
+                    st.markdown("**2. 2022년 대세 하락장**")
+                    bear_counts = res.loc[bear_mask, 'Used_Weights'].apply(
+                        lambda w: "공격형" if w['mom']>0.8 else ("방어형" if w['risk']>0.8 else "중립/균형")
+                    ).value_counts()
+                    st.bar_chart(bear_counts)
+
             st.divider()
-            st.subheader("📅 월별 포트폴리오 상세 분석")
-            
+            st.subheader("📅 월별 상세 분석")
             date_options = res['Date'].dt.strftime('%Y-%m-%d').tolist()
-            sel_date_str = st.selectbox("매수 시점 선택", date_options[::-1], index=0)
+            sel_date_str = st.selectbox("매수 시점", date_options[::-1], index=0)
             
             if sel_date_str:
-                sel_date = pd.to_datetime(sel_date_str)
-                row = res[res['Date'] == sel_date].iloc[0]
-                
-                codes = row['Holdings_List']
-                prices_dict = row['Prices_Dict']
-                
-                # [추가] 해당 월 적용 전략 표시 (동적 모드일 경우)
+                row = res[res['Date'] == pd.to_datetime(sel_date_str)].iloc[0]
                 if 'Used_Weights' in row:
                     w = row['Used_Weights']
                     st.info(f"📌 적용 가중치: 추세 {w['mom']} | 수급 {w['liq']} | 저변동 {w['vol']} | 방어 {w['risk']}")
-
-                detail_data = []
-                for c in codes:
-                    name = TICKER_INFO.get(c, c)
-                    sector = infer_sector_kr(name, c) 
-                    price = prices_dict.get(c, 0)
-                    detail_data.append({
-                        "종목명": name,
-                        "코드": c,
-                        "섹터": sector,
-                        "매수가(종가)": f"{price:,.0f}원"
-                    })
                 
-                df_detail = pd.DataFrame(detail_data)
-                st.dataframe(df_detail, use_container_width=True)
-                st.caption(f"※ 선정 기준일(T-1)의 데이터로 분석하여, {sel_date_str} 당일(T) 종가에 매수한 내역입니다. (Standard Rebalancing Rule)")
-        else:
-            st.warning("결과 없음 (조건에 맞는 종목이 없습니다)")
+                codes = row['Holdings_List']
+                prices = row['Prices_Dict']
+                det = []
+                for c in codes:
+                    det.append({
+                        "종목명": TICKER_INFO.get(c, c),
+                        "코드": c,
+                        "섹터": infer_sector_kr(TICKER_INFO.get(c, c), c),
+                        "매수가": f"{prices.get(c,0):,.0f}원"
+                    })
+                st.dataframe(pd.DataFrame(det), use_container_width=True)
+                st.caption(f"※ {sel_date_str} 종가 매수 (Standard Rebalancing)")
 
 elif mode == "🔍 전략 최적화":
     st.info("다양한 전략의 성과를 비교 분석합니다.")
@@ -589,17 +686,14 @@ elif mode == "🔍 전략 최적화":
             
             for i, (name, w) in enumerate(PRESETS.items()):
                 if name == "사용자 정의": continue
-                
                 ws = {'mom': w[0], 'liq': w[1], 'vol': w[2], 'risk': w[3]}
-                res = run_backtest(p, v, ws, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="Fixed")
-                
+                res = run_backtest(p, v, ws, TICKER_INFO, CONST, benchmark=main_bm)
                 if not res.empty:
                     res_c = res.set_index('Sell_Date')
                     mets = calculate_metrics(res_c)
                     mets['전략명'] = name
                     mets['가중치'] = f"{w[0]}|{w[1]}|{w[2]}|{w[3]}"
                     results.append(mets)
-                
                 progress_bar.progress((i+1)/len(PRESETS))
                 
             if results:
@@ -613,21 +707,7 @@ elif mode == "🔍 전략 최적화":
                 best_strat = res_df.iloc[0]['전략명']
                 st.success(f"🏆 추천 전략: {best_strat}")
                 
-                best_w_str = res_df.iloc[0]['가중치']
-                best_w_list = list(map(float, best_w_str.split('|')))
-                best_weights = {'mom': best_w_list[0], 'liq': best_w_list[1], 'vol': best_w_list[2], 'risk': best_w_list[3]}
-                
-                res_best = run_backtest(p, v, best_weights, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="Fixed")
-                if not res_best.empty:
-                    res_best = res_best.set_index('Date')
-                    res_best['Cum'] = (1+res_best['Port_Ret']).cumprod()
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=res_best.index, y=res_best['Cum'], name=best_strat, line=dict(color='#FFD700', width=2)))
-                    if 'KOSPI' in bms:
-                        b = bms['KOSPI'].reindex(res_best.index, method='ffill')
-                        b = b / b.iloc[0]
-                        fig.add_trace(go.Scatter(x=b.index, y=b, name='KOSPI', line=dict(dash='dot', color='red')))
-                    st.plotly_chart(fig, use_container_width=True)
+                # 차트는 생략하거나 필요 시 추가
             else:
                 st.warning("결과 없음")
         else:
