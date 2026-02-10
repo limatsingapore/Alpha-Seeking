@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v8.5)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v8.6)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -52,8 +52,6 @@ PRESETS = {
     "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8), "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1), 
     "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9), "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6), 
     "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2), "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7),
-    
-    # [추가] 시장 상황별 최적화 프리셋
     "📈 상승장 최적화": (0.9, 0.7, 0.0, 0.1),
     "📉 하락장 최적화": (0.2, 0.3, 0.8, 0.9),
     "🦀 횡보장 최적화": (0.5, 0.8, 0.4, 0.6)
@@ -143,10 +141,11 @@ def fetch_data_serial(universe, start_date, end_date):
         if not kospi.empty: bm_dict['KOSPI'] = kospi['Close']
     except: pass
     
-    progress_text = "데이터 수집 중... (0%)"
-    my_bar = st.progress(0, text=progress_text)
-    total = len(universe)
+    # 데이터 수집 진행 상황은 cache되면 안 보이므로, 
+    # 최초 실행 시에만 Streamlit 내부 로직으로 표시됨.
+    # 여기서는 진행바를 별도로 만들지 않고 st.spinner 등으로 대체하는 것이 깔끔함.
     
+    total = len(universe)
     for i, code in enumerate(universe):
         try:
             d = fdr.DataReader(code, s_str, e_str)
@@ -154,12 +153,7 @@ def fetch_data_serial(universe, start_date, end_date):
                 if 'Close' in d.columns: p_dict[code] = d['Close']
                 if 'Volume' in d.columns: v_dict[code] = d['Volume']
         except: pass
-        
-        if i % 10 == 0:
-            my_bar.progress((i + 1) / total, text=f"데이터 수집 중... ({i+1}/{total})")
             
-    my_bar.empty()
-    
     df_p = pd.DataFrame(p_dict)
     df_v = pd.DataFrame(v_dict)
     
@@ -237,70 +231,41 @@ def rank_and_score(factor_df, weights, ticker_map=None):
     return scored.sort_values(by='Total_Score', ascending=False)
 
 # ==============================================================================
-# [마켓 타이밍 로직 (고도화)]
+# [마켓 타이밍 로직]
 # ==============================================================================
 def get_market_adaptive_weights(strategy_mode, benchmark_series, current_date, prev_weights=None):
-    """
-    관성 효과와 정교한 추세 판단을 포함한 마켓 타이밍 엔진
-    """
     bm_slice = benchmark_series.loc[:current_date]
     
-    # 1. 초기 데이터 부족 처리
     if len(bm_slice) < 120:
-        if len(bm_slice) >= 60:
-            pass # 60일 이상이면 VIX 계산 가능하므로 진행
-        else:
-            return PRESETS["⚖️ 황금 밸런스"] # 정말 초기엔 균형
+        if len(bm_slice) >= 60: pass 
+        else: return PRESETS["⚖️ 황금 밸런스"]
 
-    # 지표 계산
-    recent_vol = bm_slice.pct_change().tail(60).std() * np.sqrt(252) * 100 # VIX
+    recent_vol = bm_slice.pct_change().tail(60).std() * np.sqrt(252) * 100 
     
     ma_20 = bm_slice.tail(20).mean()
     ma_60 = bm_slice.tail(60).mean()
     ma_120 = bm_slice.tail(120).mean()
     current_price = bm_slice.iloc[-1]
     
-    # 추세 강도 점수 (Trend Score): 장기 이평선 대비 이격도
     trend_score = (current_price - ma_120) / ma_120 * 100 if ma_120 > 0 else 0
 
-    # -----------------------------------------------------
-    # Mode 1: VIX 변동성 스위칭 (Inertia 적용)
-    # -----------------------------------------------------
     if strategy_mode == "VIX 변동성 스위칭":
-        # 버퍼존 (13~17): 기존 전략 유지 (잦은 매매 방지)
-        if prev_weights is not None and 13 < recent_vol < 17:
-            return prev_weights
-            
-        if recent_vol < 15: # 안정장
-            return (0.9, 0.8, 0.0, 0.3) 
-        elif recent_vol < 25: # 정상장
-            return PRESETS["🐆 안전한 사냥"]
-        else: # 공포장
-            return (0.2, 0.3, 0.8, 0.9)
+        if prev_weights is not None and 13 < recent_vol < 17: return prev_weights
+        if recent_vol < 15: return (0.9, 0.8, 0.0, 0.3) 
+        elif recent_vol < 25: return PRESETS["🐆 안전한 사냥"]
+        else: return (0.2, 0.3, 0.8, 0.9)
 
-    # -----------------------------------------------------
-    # Mode 2: Trend 추세 추종 (정교화)
-    # -----------------------------------------------------
     elif strategy_mode == "Trend 추세 추종":
-        if ma_20 > ma_60 > ma_120 and trend_score > 0: # 확고한 상승
-            return PRESETS["🌪️ 변동성 사냥꾼"]
-        elif ma_20 < ma_60 < ma_120 and trend_score < -5: # 확고한 하락
-            return PRESETS["🏰 철벽 방어"]
-        elif abs(trend_score) < 3: # 횡보장 (박스권)
-            return PRESETS["🌊 세력주 포착"] # 수급 위주
-        else:
-            return PRESETS["🐆 안전한 사냥"]
+        if ma_20 > ma_60 > ma_120 and trend_score > 0: return PRESETS["🌪️ 변동성 사냥꾼"]
+        elif ma_20 < ma_60 < ma_120 and trend_score < -5: return PRESETS["🏰 철벽 방어"]
+        elif abs(trend_score) < 3: return PRESETS["🌊 세력주 포착"] 
+        else: return PRESETS["🐆 안전한 사냥"]
 
-    # -----------------------------------------------------
-    # Mode 3: Hybrid (VIX + Trend)
-    # -----------------------------------------------------
     elif strategy_mode == "Hybrid (VIX+Trend)":
-        # VIX Signal (-1:방어, 0:중립, 1:공격)
         vix_signal = 0
         if recent_vol < 15: vix_signal = 1
         elif recent_vol > 25: vix_signal = -1
         
-        # Trend Signal
         trend_signal = 0
         if ma_20 > ma_60 > ma_120 and trend_score > 0: trend_signal = 1
         elif ma_20 < ma_60 < ma_120 and trend_score < -5: trend_signal = -1
@@ -314,15 +279,14 @@ def get_market_adaptive_weights(strategy_mode, benchmark_series, current_date, p
     return PRESETS["⚖️ 황금 밸런스"]
 
 # ==============================================================================
-# [백테스트 엔진]
+# [백테스트 엔진 (Progress Bar 연동)]
 # ==============================================================================
 def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=None, strategy_mode="Fixed"):
     if prices.empty: return pd.DataFrame()
     
     reb_dates = prices.resample('BM').last().index
     logs = []
-    
-    # [추가] 이전 달 가중치 추적용 변수
+    prev_picks = [] 
     prev_weights = None
     target_n = CONST['TOP_N'] 
     
@@ -331,21 +295,30 @@ def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=
     else:
         benchmark = benchmark.reindex(prices.index).ffill().fillna(method='bfill')
 
-    for i in range(12, len(reb_dates)):
+    # 루프 범위 확인
+    valid_dates = [d for d in reb_dates if d >= prices.index[0] + timedelta(days=60)]
+    if not valid_dates: return pd.DataFrame()
+
+    start_idx = 0
+    for i, d in enumerate(reb_dates):
+        if d in valid_dates:
+            start_idx = i
+            break
+            
+    # 여기서부터 실제 백테스트 루프
+    loop_range = range(start_idx, len(reb_dates))
+    
+    for i in loop_range:
         rebal_date = reb_dates[i] 
         if i < len(reb_dates) - 1: next_rebal = reb_dates[i+1]
         else: next_rebal = prices.index[-1]
         if rebal_date > prices.index[-1]: break
             
         try:
-            # [전략 결정]
-            if strategy_mode in ["VIX 변동성 스위칭", "Trend 추세 추종", "Hybrid (VIX+Trend)"]:
-                # T-1일 기준 판단
+            if strategy_mode != "Fixed":
                 decision_date = prices.index[prices.index.searchsorted(rebal_date) - 1]
                 w_tuple = get_market_adaptive_weights(strategy_mode, benchmark, decision_date, prev_weights)
                 current_weights = {'mom': w_tuple[0], 'liq': w_tuple[1], 'vol': w_tuple[2], 'risk': w_tuple[3]}
-                
-                # 다음 달을 위해 저장 (관성 효과용)
                 prev_weights = w_tuple
             else:
                 current_weights = initial_weights
@@ -423,7 +396,7 @@ def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=
                 'Holdings_List': picks, 
                 'Prices_Dict': current_prices, 
                 'Port_Ret': net_ret,
-                'Used_Weights': current_weights # 기록
+                'Used_Weights': current_weights 
             })
             
         except: continue
@@ -467,7 +440,7 @@ def calculate_metrics(res_df):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v8.5)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v8.6)")
 
 def update_sliders():
     ps = st.session_state['preset_select']
@@ -495,7 +468,6 @@ with st.sidebar:
     st.divider()
     
     if mode == "📉 백테스트":
-        # 4가지 모드 제공
         strategy_type = st.radio("전략 운용 방식", ["고정 가중치 (Fixed)", "VIX 변동성 스위칭", "Trend 추세 추종", "Hybrid (VIX+Trend)"])
         
         if strategy_type == "고정 가중치 (Fixed)":
@@ -522,7 +494,7 @@ with st.sidebar:
 
 if mode == "📉 백테스트":
     st.write("") 
-    # [기능 추가] 전체 전략 비교 실행 버튼
+    
     c_btn1, c_btn2 = st.columns([1, 1])
     with c_btn1:
         run_single = st.button("현재 설정으로 실행", type="primary", key="btn_run_single")
@@ -530,34 +502,48 @@ if mode == "📉 백테스트":
         run_compare = st.button("⚡ 4개 모드 동시 비교", key="btn_run_compare")
 
     if run_single:
+        # [UI] 단일 실행 진행바
+        prog_bar = st.progress(0, text="데이터 불러오는 중...")
+        
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
-        st.success(f"데이터 수집 완료: 총 {len(p.columns)}개 종목")
+        prog_bar.progress(0.2, text="데이터 수집 완료. 백테스트 엔진 가동...")
         
         if not p.empty:
             main_bm = bms.get('KOSPI')
             if main_bm is None: main_bm = pd.Series(1.0, index=p.index)
             
             res = run_backtest(p, v, weights, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode=strategy_type)
+            prog_bar.progress(0.8, text="시뮬레이션 완료. 결과 분석 및 시각화 중...")
             
             st.session_state['bt_p'] = p
             st.session_state['bt_bms'] = bms
             st.session_state['bt_res'] = res
             st.session_state['bt_ran'] = True
             st.session_state['bt_mode'] = 'single'
+            
+            # [UI] 100% 도달 후 즉시 표시
+            prog_bar.progress(1.0, text="완료!")
+            time.sleep(0.3)
+            prog_bar.empty()
         else:
             st.error("데이터 수집 실패")
 
     elif run_compare:
+        # [UI] 비교 분석 진행바
+        prog_bar = st.progress(0, text="데이터 불러오는 중...")
+        
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
-        st.success(f"데이터 수집 완료: 비교 분석 시작...")
+        prog_bar.progress(0.1, text="데이터 수집 완료. 전략 4종 동시 실행 중...")
         
         if not p.empty:
             main_bm = bms.get('KOSPI')
             if main_bm is None: main_bm = pd.Series(1.0, index=p.index)
             
             comp_results = []
-            # 1. 고정 (안전한 사냥 기준)
+            
+            # 1. 고정
             res_fixed = run_backtest(p, v, PRESETS["🐆 안전한 사냥"], TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="Fixed")
+            prog_bar.progress(0.3, text="1/4: 고정 전략 완료...")
             if not res_fixed.empty: 
                 m = calculate_metrics(res_fixed.set_index('Sell_Date'))
                 m['전략'] = "고정 (안전한 사냥)"
@@ -565,6 +551,7 @@ if mode == "📉 백테스트":
             
             # 2. VIX
             res_vix = run_backtest(p, v, None, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="VIX 변동성 스위칭")
+            prog_bar.progress(0.5, text="2/4: 변동성 스위칭 완료...")
             if not res_vix.empty:
                 m = calculate_metrics(res_vix.set_index('Sell_Date'))
                 m['전략'] = "VIX 변동성 스위칭"
@@ -572,6 +559,7 @@ if mode == "📉 백테스트":
                 
             # 3. Trend
             res_trend = run_backtest(p, v, None, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="Trend 추세 추종")
+            prog_bar.progress(0.7, text="3/4: 추세 추종 완료...")
             if not res_trend.empty:
                 m = calculate_metrics(res_trend.set_index('Sell_Date'))
                 m['전략'] = "Trend 추세 추종"
@@ -579,19 +567,23 @@ if mode == "📉 백테스트":
 
             # 4. Hybrid
             res_hybrid = run_backtest(p, v, None, TICKER_INFO, CONST, benchmark=main_bm, strategy_mode="Hybrid (VIX+Trend)")
+            prog_bar.progress(0.9, text="4/4: 하이브리드 완료. 결과표 생성 중...")
             if not res_hybrid.empty:
                 m = calculate_metrics(res_hybrid.set_index('Sell_Date'))
                 m['전략'] = "Hybrid (VIX+Trend)"
                 comp_results.append(m)
             
             st.session_state['comp_results'] = pd.DataFrame(comp_results).sort_values('CAGR', ascending=False)
-            st.session_state['bt_res'] = res_hybrid # 차트는 하이브리드 기준으로 보여줌
+            st.session_state['bt_res'] = res_hybrid 
             st.session_state['bt_p'] = p
             st.session_state['bt_bms'] = bms
             st.session_state['bt_ran'] = True
             st.session_state['bt_mode'] = 'compare'
+            
+            prog_bar.progress(1.0, text="분석 완료!")
+            time.sleep(0.3)
+            prog_bar.empty()
 
-    # 결과 표시 로직
     if st.session_state.get('bt_ran'):
         if st.session_state.get('bt_mode') == 'compare':
             st.subheader("📊 전략 모드별 성과 비교")
@@ -623,22 +615,18 @@ if mode == "📉 백테스트":
                 fig.add_trace(go.Scatter(x=b.index, y=b, name='KOSPI', line=dict(dash='dot', color='red')))
             st.plotly_chart(fig, use_container_width=True)
             
-            # [추가] 극단적 상황 시뮬레이션 분석 (결과가 있을 때만)
             with st.expander("🔍 위기 대응 분석 (Historical Check)"):
                 st.write("주요 위기 상황에서 AI가 어떤 전략을 선택했는지 확인합니다.")
                 
-                # 2020 코로나 팬데믹
                 covid_mask = (res['Date'] >= '2020-02-01') & (res['Date'] <= '2020-04-30')
                 if covid_mask.any():
                     st.markdown("**1. 코로나 팬데믹 (2020.02 ~ 04)**")
                     covid_data = res.loc[covid_mask, ['Date', 'Used_Weights']].copy()
-                    # 가중치 딕셔너리를 보기 좋게 변환
                     covid_data['전략'] = covid_data['Used_Weights'].apply(
                         lambda w: "공격형" if w['mom']>0.8 else ("방어형" if w['risk']>0.8 else "중립/균형")
                     )
                     st.dataframe(covid_data[['Date', '전략']], use_container_width=True)
                 
-                # 2022 하락장
                 bear_mask = (res['Date'] >= '2022-01-01') & (res['Date'] <= '2022-12-31')
                 if bear_mask.any():
                     st.markdown("**2. 2022년 대세 하락장**")
@@ -666,7 +654,7 @@ if mode == "📉 백테스트":
                         "종목명": TICKER_INFO.get(c, c),
                         "코드": c,
                         "섹터": infer_sector_kr(TICKER_INFO.get(c, c), c),
-                        "매수가": f"{prices.get(c,0):,.0f}원"
+                        "매수가(종가)": f"{prices.get(c,0):,.0f}원"
                     })
                 st.dataframe(pd.DataFrame(det), use_container_width=True)
                 st.caption(f"※ {sel_date_str} 종가 매수 (Standard Rebalancing)")
@@ -675,15 +663,16 @@ elif mode == "🔍 전략 최적화":
     st.info("다양한 전략의 성과를 비교 분석합니다.")
     st.write("") 
     if st.button("전략 비교 시작", key="btn_run_opt"):
+        prog_bar = st.progress(0, text="데이터 불러오는 중...")
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
+        prog_bar.progress(0.2, text="데이터 준비 완료. 시뮬레이션 시작...")
         
         if not p.empty:
             results = []
             main_bm = bms.get('KOSPI')
             if main_bm is None: main_bm = pd.Series(1.0, index=p.index)
             
-            progress_bar = st.progress(0)
-            
+            total_presets = len(PRESETS)
             for i, (name, w) in enumerate(PRESETS.items()):
                 if name == "사용자 정의": continue
                 ws = {'mom': w[0], 'liq': w[1], 'vol': w[2], 'risk': w[3]}
@@ -694,9 +683,13 @@ elif mode == "🔍 전략 최적화":
                     mets['전략명'] = name
                     mets['가중치'] = f"{w[0]}|{w[1]}|{w[2]}|{w[3]}"
                     results.append(mets)
-                progress_bar.progress((i+1)/len(PRESETS))
+                
+                # 진행률 0.2 ~ 0.9 사이 분포
+                current_prog = 0.2 + (0.7 * (i+1) / total_presets)
+                prog_bar.progress(current_prog, text=f"분석 중: {name}")
                 
             if results:
+                prog_bar.progress(0.95, text="결과 표 생성 중...")
                 res_df = pd.DataFrame(results).sort_values("CAGR", ascending=False)
                 disp_cols = ['전략명', 'CAGR', 'MDD', 'Sharpe', 'Sortino', 'Win_Rate', 'Alpha', 'Beta']
                 st.dataframe(res_df[disp_cols].style.format({
@@ -707,7 +700,9 @@ elif mode == "🔍 전략 최적화":
                 best_strat = res_df.iloc[0]['전략명']
                 st.success(f"🏆 추천 전략: {best_strat}")
                 
-                # 차트는 생략하거나 필요 시 추가
+                prog_bar.progress(1.0, text="완료!")
+                time.sleep(0.3)
+                prog_bar.empty()
             else:
                 st.warning("결과 없음")
         else:
