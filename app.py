@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Restored v8.2)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v9.4)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -21,7 +21,6 @@ st.markdown("""
     [data-testid="stMetricLabel"] { color: #94a3b8 !important; font-size: 0.8rem !important; }
     [data-testid="stMetricValue"] { color: #f8fafc !important; font-size: 1.1rem !important; }
     div[data-testid="stExpander"] { background-color: #1e293b; border-radius: 8px; }
-    /* 로딩바 겹침 방지를 위한 상단 여백 추가 */
     .stProgress { margin-top: 20px; margin-bottom: 20px; }
     </style>
     """, unsafe_allow_html=True)
@@ -39,6 +38,23 @@ CONST = {
     'COST_RATE': 0.002, 
     'MIN_AMT': 5_000_000_000, 
     'TOP_N': 20 
+}
+
+# ==============================================================================
+# [프리셋 정의]
+# ==============================================================================
+PRESETS = {
+    "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
+    "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🌊 세력주 포착": (0.4, 1.0, 0.2, 0.2),
+    "🏰 철벽 방어": (0.1, 0.1, 1.0, 1.0), "🧘 마음의 평화": (0.3, 0.2, 1.0, 0.5),
+    "🚑 좀비 헌터": (0.4, 0.3, 0.3, 1.0), "⚖️ 황금 밸런스": (0.5, 0.5, 0.5, 0.5),
+    "💎 우상향 정석": (0.7, 0.3, 0.7, 0.4), "🐆 안전한 사냥": (0.8, 0.7, 0.1, 0.8),
+    "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8), "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1), 
+    "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9), "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6), 
+    "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2), "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7),
+    "📈 상승장 최적화": (0.9, 0.7, 0.0, 0.1),
+    "📉 하락장 최적화": (0.2, 0.3, 0.8, 0.9),
+    "🦀 횡보장 최적화": (0.5, 0.8, 0.4, 0.6)
 }
 
 # ==============================================================================
@@ -92,7 +108,7 @@ def infer_sector_kr(name, code=None):
     return '기타/소형주'
 
 # ==============================================================================
-# [데이터 로더]
+# [데이터 로더] - (안정화 패치 적용)
 # ==============================================================================
 @st.cache_data(ttl=3600*12)
 def load_kr_data():
@@ -120,22 +136,30 @@ def fetch_data_serial(universe, start_date, end_date):
     
     p_dict, v_dict, bm_dict = {}, {}, {}
     
-    try:
-        kospi = fdr.DataReader('KS11', s_str, e_str)
-        if not kospi.empty: bm_dict['KOSPI'] = kospi['Close']
-    except: pass
+    # [안정화 1] 벤치마크 재시도 로직
+    for attempt in range(3):
+        try:
+            kospi = fdr.DataReader('KS11', s_str, e_str)
+            if not kospi.empty: 
+                bm_dict['KOSPI'] = kospi['Close']
+                break
+        except: time.sleep(1)
     
     progress_text = "데이터 수집 중... (0%)"
     my_bar = st.progress(0, text=progress_text)
     total = len(universe)
     
     for i, code in enumerate(universe):
-        try:
-            d = fdr.DataReader(code, s_str, e_str)
-            if len(d) > 120 and d['Close'].iloc[-1] > 0:
-                if 'Close' in d.columns: p_dict[code] = d['Close']
-                if 'Volume' in d.columns: v_dict[code] = d['Volume']
-        except: pass
+        # [안정화 2] 개별 종목 재시도 로직 (Retry)
+        for attempt in range(3): # 최대 3번 시도
+            try:
+                d = fdr.DataReader(code, s_str, e_str)
+                if len(d) > 120 and d['Close'].iloc[-1] > 0:
+                    if 'Close' in d.columns: p_dict[code] = d['Close']
+                    if 'Volume' in d.columns: v_dict[code] = d['Volume']
+                break # 성공하면 루프 탈출
+            except: 
+                time.sleep(0.5) # 실패 시 0.5초 대기
         
         if i % 10 == 0:
             my_bar.progress((i + 1) / total, text=f"데이터 수집 중... ({i+1}/{total})")
@@ -212,6 +236,8 @@ def rank_and_score(factor_df, weights, ticker_map=None):
         scored['Z_MDD'] * weights['risk']
     )
     
+    # [안정화 3] 정렬 기준에 index(종목코드)를 추가하여 순서 고정 (Deterministic Sort)
+    scored = scored.sort_index() # 인덱스로 1차 정렬 (동점자 처리용)
     return scored.sort_values(by='Total_Score', ascending=False)
 
 def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
@@ -386,7 +412,7 @@ def optimize_strategy(prices, volumes, ticker_map, presets, const):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Restored v8.2)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v9.4)")
 
 PRESETS = {
     "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
@@ -397,7 +423,6 @@ PRESETS = {
     "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8), "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1), 
     "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9), "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6), 
     "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2), "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7),
-    # 요청하셨던 3종 프리셋 복구
     "📈 상승장 최적화": (0.9, 0.7, 0.0, 0.1),
     "📉 하락장 최적화": (0.2, 0.3, 0.8, 0.9),
     "🦀 횡보장 최적화": (0.5, 0.8, 0.4, 0.6)
@@ -450,7 +475,7 @@ with st.sidebar:
     weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
 
 if mode == "📉 백테스트":
-    st.write("") # [수정] 상단 여백 추가 (로딩바 겹침 방지)
+    st.write("") 
     if st.button("실행", type="primary", key="btn_run_backtest"):
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
         
@@ -514,7 +539,6 @@ if mode == "📉 백테스트":
                     
                     df_detail = pd.DataFrame(detail_data)
                     st.dataframe(df_detail, use_container_width=True)
-                    # [수정] 안내 메시지 명확화
                     st.caption(f"※ 선정 기준일(T-1)의 데이터로 분석하여, {sel_date_str} 당일(T) 종가에 매수한 내역입니다. (Standard Rebalancing Rule)")
 
             else:
