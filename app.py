@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v9.0)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v9.1)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -41,7 +41,7 @@ CONST = {
 }
 
 # ==============================================================================
-# [프리셋 정의]
+# [프리셋 정의] - (복구 완료)
 # ==============================================================================
 PRESETS = {
     "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
@@ -51,7 +51,12 @@ PRESETS = {
     "💎 우상향 정석": (0.7, 0.3, 0.7, 0.4), "🐆 안전한 사냥": (0.8, 0.7, 0.1, 0.8),
     "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8), "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1), 
     "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9), "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6), 
-    "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2), "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7)
+    "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2), "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7),
+    
+    # [복구됨] 시장 상황별 최적화 프리셋
+    "📈 상승장 최적화": (0.9, 0.7, 0.0, 0.1),
+    "📉 하락장 최적화": (0.2, 0.3, 0.8, 0.9),
+    "🦀 횡보장 최적화": (0.5, 0.8, 0.4, 0.6)
 }
 
 # ==============================================================================
@@ -165,6 +170,7 @@ def fetch_data_serial(universe, start_date, end_date):
 def calculate_factors(price, volume, min_amt, trading_days=252):
     if len(price) < 120 or price.iloc[-1] == 0 or np.isnan(price.iloc[-1]): return None
     
+    # [거래정지 감지 필터 유지]
     zero_volume_days = (volume.tail(20) == 0).sum()
     if zero_volume_days >= 3: return None 
 
@@ -298,7 +304,7 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
             ret_vec = ret_vec.fillna(0)
             gross_ret = ret_vec.mean()
             
-            # 회전율 계산
+            # [비용 로직 유지: 회전율 반영]
             if not prev_picks: 
                 turnover = 1.0
             else:
@@ -381,7 +387,7 @@ def calculate_metrics(res_df):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v9.0)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v9.1)")
 
 def reset_results():
     st.session_state['bt_ran'] = False
@@ -431,7 +437,7 @@ with st.sidebar:
 if mode == "📉 백테스트":
     st.write("") 
     if st.button("실행", type="primary", key="btn_run_backtest"):
-        # [핵심] Force Injection: 화면 값을 그대로 주입
+        # [핵심] Force Injection
         forced_weights = {
             'mom': st.session_state['slider_mom'],
             'liq': st.session_state['slider_liq'],
