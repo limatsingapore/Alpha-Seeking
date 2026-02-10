@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v9.4)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v9.5)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -63,10 +63,6 @@ PRESETS = {
 def get_last_complete_month_end():
     return datetime.now()
 
-def z_score(x):
-    if x.std() == 0: return x * 0
-    return (x - x.mean()) / x.std()
-
 def calculate_slippage(amount_traded, avg_daily_volume):
     if avg_daily_volume == 0: return 0.01 
     participation_rate = amount_traded / avg_daily_volume
@@ -108,7 +104,7 @@ def infer_sector_kr(name, code=None):
     return '기타/소형주'
 
 # ==============================================================================
-# [데이터 로더] - (안정화 패치 적용)
+# [데이터 로더] - (안정화 Retry 적용)
 # ==============================================================================
 @st.cache_data(ttl=3600*12)
 def load_kr_data():
@@ -136,36 +132,26 @@ def fetch_data_serial(universe, start_date, end_date):
     
     p_dict, v_dict, bm_dict = {}, {}, {}
     
-    # [안정화 1] 벤치마크 재시도 로직
-    for attempt in range(3):
+    # 벤치마크 (Retry)
+    for _ in range(3):
         try:
             kospi = fdr.DataReader('KS11', s_str, e_str)
             if not kospi.empty: 
                 bm_dict['KOSPI'] = kospi['Close']
                 break
-        except: time.sleep(1)
+        except: time.sleep(0.5)
     
-    progress_text = "데이터 수집 중... (0%)"
-    my_bar = st.progress(0, text=progress_text)
-    total = len(universe)
-    
+    # 개별 종목 (Retry)
     for i, code in enumerate(universe):
-        # [안정화 2] 개별 종목 재시도 로직 (Retry)
-        for attempt in range(3): # 최대 3번 시도
+        for _ in range(3):
             try:
                 d = fdr.DataReader(code, s_str, e_str)
-                if len(d) > 120 and d['Close'].iloc[-1] > 0:
+                if len(d) > 60 and d['Close'].iloc[-1] > 0:
                     if 'Close' in d.columns: p_dict[code] = d['Close']
                     if 'Volume' in d.columns: v_dict[code] = d['Volume']
-                break # 성공하면 루프 탈출
-            except: 
-                time.sleep(0.5) # 실패 시 0.5초 대기
-        
-        if i % 10 == 0:
-            my_bar.progress((i + 1) / total, text=f"데이터 수집 중... ({i+1}/{total})")
+                break
+            except: time.sleep(0.2)
             
-    my_bar.empty()
-    
     df_p = pd.DataFrame(p_dict)
     df_v = pd.DataFrame(v_dict)
     
@@ -183,6 +169,11 @@ def fetch_data_serial(universe, start_date, end_date):
 # ==============================================================================
 def calculate_factors(price, volume, min_amt, trading_days=252):
     if len(price) < 120 or price.iloc[-1] == 0 or np.isnan(price.iloc[-1]): return None
+    
+    # 거래정지 필터
+    zero_volume_days = (volume.tail(20) == 0).sum()
+    if zero_volume_days >= 3: return None 
+
     try:
         p = price
         v = volume
@@ -236,17 +227,19 @@ def rank_and_score(factor_df, weights, ticker_map=None):
         scored['Z_MDD'] * weights['risk']
     )
     
-    # [안정화 3] 정렬 기준에 index(종목코드)를 추가하여 순서 고정 (Deterministic Sort)
-    scored = scored.sort_index() # 인덱스로 1차 정렬 (동점자 처리용)
+    # [안정화] 정렬 순서 고정 (Deterministic Sort)
+    scored = scored.sort_index() 
     return scored.sort_values(by='Total_Score', ascending=False)
 
-def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
+# ==============================================================================
+# [백테스트 엔진] - (진행바 UI 연동용 yield 구조 아님, 외부에서 제어)
+# ==============================================================================
+def run_backtest_logic(prices, volumes, weights, ticker_map, const, benchmark=None):
     if prices.empty: return pd.DataFrame()
     
     reb_dates = prices.resample('BM').last().index
     logs = []
     prev_picks = [] 
-    
     target_n = CONST['TOP_N'] 
     
     if benchmark is None or benchmark.empty:
@@ -254,9 +247,17 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
     else:
         benchmark = benchmark.reindex(prices.index).ffill().fillna(method='bfill')
 
-    for i in range(12, len(reb_dates)):
+    # 시작일 보정
+    start_idx = 0
+    for i, d in enumerate(reb_dates):
+        if d >= prices.index[0] + timedelta(days=120): 
+            start_idx = i
+            break
+            
+    loop_range = range(start_idx, len(reb_dates))
+    
+    for i in loop_range:
         rebal_date = reb_dates[i] 
-        
         if i < len(reb_dates) - 1: next_rebal = reb_dates[i+1]
         else: next_rebal = prices.index[-1]
         
@@ -264,7 +265,6 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
             
         try:
             min_trade_amt = CONST['MIN_AMT']
-            
             rebal_idx = prices.index.searchsorted(rebal_date)
             if rebal_idx <= 0: continue
             selection_date = prices.index[rebal_idx - 1]
@@ -273,6 +273,8 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
             v_sub = volumes.loc[:selection_date].tail(300)
             
             valid_cols = p_sub.columns[p_sub.iloc[-1].notna()]
+            if len(valid_cols) == 0: continue
+
             daily_factors = []
             for t in valid_cols:
                 f = calculate_factors(p_sub[t], v_sub[t], min_trade_amt)
@@ -295,8 +297,7 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
             current_prices = {}
             for t in picks:
                 buy_p = prices.at[buy_date, t]
-                if not np.isnan(buy_p):
-                    current_prices[t] = buy_p
+                if not np.isnan(buy_p): current_prices[t] = buy_p
 
             curr_prices = prices.loc[buy_date, picks].fillna(0).replace(0, np.nan).ffill()
             next_prices = prices.loc[sell_date, picks].fillna(0)
@@ -307,9 +308,8 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
             
             if not prev_picks: turnover = 1.0
             else:
-                denom = len(picks)
                 kept = set(prev_picks) & set(picks)
-                turnover = (denom - len(kept)) / denom
+                turnover = (len(picks) - len(kept)) / len(picks)
             
             assumed_capital = 100_000_000
             target_amt_per_stock = assumed_capital / len(picks)
@@ -323,15 +323,15 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
                     s_costs.append(calculate_slippage(target_amt_per_stock, avg_v))
             avg_slippage = np.mean(s_costs) if s_costs else 0.002
             
-            total_cost = (const['COST_RATE'] + avg_slippage) * turnover
+            total_cost = (CONST['COST_RATE'] + avg_slippage) * turnover
             net_ret = gross_ret - total_cost
             
             try:
                 b_s = benchmark.asof(buy_date)
                 b_e = benchmark.asof(sell_date)
-                if isinstance(b_s, pd.Series): b_s = b_s.iloc[0]
-                if isinstance(b_e, pd.Series): b_e = b_e.iloc[0]
-                bm_ret = (b_e / b_s) - 1 if b_s != 0 else 0.0
+                val_s = b_s.iloc[0] if isinstance(b_s, pd.Series) else b_s
+                val_e = b_e.iloc[0] if isinstance(b_e, pd.Series) else b_e
+                bm_ret = (val_e / val_s) - 1 if val_s != 0 else 0.0
             except: bm_ret = 0.0
                 
             logs.append({
@@ -340,12 +340,11 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
                 'Gross_Ret': gross_ret, 
                 'Net_Ret': net_ret,
                 'BM_Ret': bm_ret, 
-                'Turnover': turnover,
                 'Holdings_List': picks, 
                 'Prices_Dict': current_prices, 
                 'Port_Ret': net_ret
             })
-            prev_picks = picks
+            prev_picks = picks 
             
         except: continue
             
@@ -353,6 +352,7 @@ def run_backtest(prices, volumes, weights, ticker_map, const, benchmark=None):
 
 def calculate_metrics(res_df):
     if res_df.empty: return {}
+    res_df = res_df.sort_index()
     
     mean_ret = res_df['Port_Ret'].mean() * 12
     volatility = res_df['Port_Ret'].std() * np.sqrt(12)
@@ -366,8 +366,9 @@ def calculate_metrics(res_df):
     mdd = (cum / cum.cummax() - 1).min()
     
     try:
-        if len(res_df) > 1:
-            slope, intercept = np.polyfit(res_df['BM_Ret'], res_df['Port_Ret'], 1)
+        clean_df = res_df[['BM_Ret', 'Port_Ret']].dropna()
+        if len(clean_df) > 5:
+            slope, intercept = np.polyfit(clean_df['BM_Ret'], clean_df['Port_Ret'], 1)
             beta = slope
             alpha = intercept * 12 
         else:
@@ -385,48 +386,15 @@ def calculate_metrics(res_df):
         'Win_Rate': (res_df['Port_Ret'] > 0).sum() / len(res_df)
     }
 
-def optimize_strategy(prices, volumes, ticker_map, presets, const):
-    results = []
-    if prices.empty: return pd.DataFrame()
-    prog = st.progress(0, text="시뮬레이션 시작...")
-    
-    bm_series = pd.Series(1.0, index=prices.index) 
-    
-    for i, (name, w) in enumerate(presets.items()):
-        weights = {'mom': w[0], 'liq': w[1], 'vol': w[2], 'risk': w[3]}
-        try:
-            res = run_backtest(prices, volumes, weights, ticker_map, const, benchmark=bm_series)
-            if not res.empty:
-                res = res.set_index('Sell_Date')
-                metrics = calculate_metrics(res)
-                metrics['전략명'] = name
-                metrics['가중치'] = f"{w[0]}|{w[1]}|{w[2]}|{w[3]}"
-                results.append(metrics)
-        except: pass
-        prog.progress((i+1)/len(presets), text=f"분석 중: {name}")
-    
-    prog.empty()
-    if not results: return pd.DataFrame()
-    return pd.DataFrame(results).sort_values('CAGR', ascending=False)
-
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v9.4)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v9.5)")
 
-PRESETS = {
-    "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
-    "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🌊 세력주 포착": (0.4, 1.0, 0.2, 0.2),
-    "🏰 철벽 방어": (0.1, 0.1, 1.0, 1.0), "🧘 마음의 평화": (0.3, 0.2, 1.0, 0.5),
-    "🚑 좀비 헌터": (0.4, 0.3, 0.3, 1.0), "⚖️ 황금 밸런스": (0.5, 0.5, 0.5, 0.5),
-    "💎 우상향 정석": (0.7, 0.3, 0.7, 0.4), "🐆 안전한 사냥": (0.8, 0.7, 0.1, 0.8),
-    "🧠 스마트 머니": (0.5, 0.8, 0.3, 0.8), "⚡ 번개 스캘핑": (1.0, 0.8, 0.0, 0.1), 
-    "🛡️ 연금 굴리기": (0.2, 0.3, 0.9, 0.9), "🎯 퀄리티 그로스": (0.6, 0.6, 0.6, 0.6), 
-    "🌪️ 변동성 사냥꾼": (0.7, 0.5, 0.0, 0.2), "🦅 매파의 눈": (0.3, 0.9, 0.4, 0.7),
-    "📈 상승장 최적화": (0.9, 0.7, 0.0, 0.1),
-    "📉 하락장 최적화": (0.2, 0.3, 0.8, 0.9),
-    "🦀 횡보장 최적화": (0.5, 0.8, 0.4, 0.6)
-}
+# [복구] 상태 초기화 (입력 변경 시)
+def reset_results():
+    st.session_state['bt_ran'] = False
+    st.session_state['bt_res'] = pd.DataFrame()
 
 def update_sliders():
     ps = st.session_state['preset_select']
@@ -436,12 +404,16 @@ def update_sliders():
         st.session_state['slider_liq'] = vals[1]
         st.session_state['slider_vol'] = vals[2]
         st.session_state['slider_risk'] = vals[3]
+    reset_results()
+
+def on_slider_change():
+    reset_results()
 
 c_d1, c_d2 = st.columns(2)
 with c_d1: 
-    s_d = st.date_input("분석 시작일", CONST['DEFAULT_START_DATE'], key="start_date_common")
+    s_d = st.date_input("분석 시작일", CONST['DEFAULT_START_DATE'], key="start_date_common", on_change=reset_results)
 with c_d2: 
-    e_d = st.date_input("분석 종료일", get_last_complete_month_end(), key="end_date_common")
+    e_d = st.date_input("분석 종료일", get_last_complete_month_end(), key="end_date_common", on_change=reset_results)
 
 with st.sidebar:
     st.info("대상: KOSPI/KOSDAQ 유동성 상위 300개")
@@ -450,121 +422,138 @@ with st.sidebar:
     if st.button("🧹 캐시 초기화", key="clear_cache"): st.cache_data.clear(); st.rerun()
     st.divider()
     
-    mode = st.radio("모드 선택", ["📉 백테스트", "🔍 전략 최적화"], key="mode_radio")
+    mode = st.radio("모드 선택", ["📉 백테스트", "🔍 전략 최적화"], key="mode_radio", on_change=reset_results)
     st.divider()
     
-    sel_preset = st.selectbox(
-        "전략 프리셋", 
-        list(PRESETS.keys()), 
-        index=9, 
-        key="preset_select",
-        on_change=update_sliders 
-    )
-    
-    if 'slider_mom' not in st.session_state:
-        init_vals = PRESETS["🐆 안전한 사냥"]
-        st.session_state['slider_mom'] = init_vals[0]
-        st.session_state['slider_liq'] = init_vals[1]
-        st.session_state['slider_vol'] = init_vals[2]
-        st.session_state['slider_risk'] = init_vals[3]
+    if mode == "📉 백테스트":
+        sel_preset = st.selectbox("전략 프리셋", list(PRESETS.keys()), index=9, key="preset_select", on_change=update_sliders)
+        
+        if 'slider_mom' not in st.session_state:
+            init_vals = PRESETS["🐆 안전한 사냥"]
+            st.session_state['slider_mom'] = init_vals[0]
+            st.session_state['slider_liq'] = init_vals[1]
+            st.session_state['slider_vol'] = init_vals[2]
+            st.session_state['slider_risk'] = init_vals[3]
 
-    w_mom = st.slider("📈 추세", 0.0, 1.0, key="slider_mom", step=0.1)
-    w_liq = st.slider("🌊 수급", 0.0, 1.0, key="slider_liq", step=0.1)
-    w_vol = st.slider("⚖️ 저변동", 0.0, 1.0, key="slider_vol", step=0.1)
-    w_risk = st.slider("🛡️ 방어", 0.0, 1.0, key="slider_risk", step=0.1)
-    weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
+        w_mom = st.slider("📈 추세", 0.0, 1.0, key="slider_mom", step=0.1, on_change=on_slider_change)
+        w_liq = st.slider("🌊 수급", 0.0, 1.0, key="slider_liq", step=0.1, on_change=on_slider_change)
+        w_vol = st.slider("⚖️ 저변동", 0.0, 1.0, key="slider_vol", step=0.1, on_change=on_slider_change)
+        w_risk = st.slider("🛡️ 방어", 0.0, 1.0, key="slider_risk", step=0.1, on_change=on_slider_change)
 
 if mode == "📉 백테스트":
     st.write("") 
     if st.button("실행", type="primary", key="btn_run_backtest"):
+        # [핵심] Force Injection
+        forced_weights = {
+            'mom': st.session_state['slider_mom'],
+            'liq': st.session_state['slider_liq'],
+            'vol': st.session_state['slider_vol'],
+            'risk': st.session_state['slider_risk']
+        }
+
+        # [복구] 매끄러운 진행바
+        prog_bar = st.progress(0, text="데이터 불러오는 중...")
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
         
-        st.success(f"데이터 수집 완료: 총 {len(p.columns)}개 종목")
-        
         if not p.empty:
+            prog_bar.progress(0.3, text="백테스트 엔진 가동 중...")
             main_bm = bms.get('KOSPI')
             if main_bm is None: main_bm = pd.Series(1.0, index=p.index)
             
-            res = run_backtest(p, v, weights, TICKER_INFO, CONST, benchmark=main_bm)
+            res = run_backtest_logic(p, v, forced_weights, TICKER_INFO, CONST, benchmark=main_bm)
             
-            if not res.empty:
-                res_chart = res.set_index('Date')
-                res_chart['Cum'] = (1+res_chart['Port_Ret']).cumprod()
-                
-                mets = calculate_metrics(res_chart)
-                
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("CAGR", f"{mets['CAGR']:.1%}")
-                m2.metric("MDD", f"{mets['MDD']:.1%}")
-                m3.metric("Sharpe", f"{mets['Sharpe']:.2f}")
-                m4.metric("Sortino", f"{mets['Sortino']:.2f}")
-                m5.metric("Win Rate", f"{mets['Win_Rate']:.1%}")
-                
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=res_chart.index, y=res_chart['Cum'], name="Strategy", line=dict(width=3, color='blue')))
-                
-                if 'KOSPI' in bms:
-                    try:
-                        b = bms['KOSPI'].reindex(res_chart.index, method='ffill')
-                        b = b / b.iloc[0]
-                        fig.add_trace(go.Scatter(x=b.index, y=b, name='KOSPI', line=dict(dash='dot', color='red')))
-                    except: pass
-                    
-                st.plotly_chart(fig, use_container_width=True)
-                
-                st.divider()
-                st.subheader("📅 월별 포트폴리오 상세 분석")
-                
-                date_options = res['Date'].dt.strftime('%Y-%m-%d').tolist()
-                sel_date_str = st.selectbox("매수 시점 선택", date_options[::-1], index=0)
-                
-                if sel_date_str:
-                    sel_date = pd.to_datetime(sel_date_str)
-                    row = res[res['Date'] == sel_date].iloc[0]
-                    
-                    codes = row['Holdings_List']
-                    prices_dict = row['Prices_Dict']
-                    
-                    detail_data = []
-                    for c in codes:
-                        name = TICKER_INFO.get(c, c)
-                        sector = infer_sector_kr(name, c) 
-                        price = prices_dict.get(c, 0)
-                        detail_data.append({
-                            "종목명": name,
-                            "코드": c,
-                            "섹터": sector,
-                            "매수가(종가)": f"{price:,.0f}원"
-                        })
-                    
-                    df_detail = pd.DataFrame(detail_data)
-                    st.dataframe(df_detail, use_container_width=True)
-                    st.caption(f"※ 선정 기준일(T-1)의 데이터로 분석하여, {sel_date_str} 당일(T) 종가에 매수한 내역입니다. (Standard Rebalancing Rule)")
-
-            else:
-                st.error("백테스트 결과가 없습니다.")
+            prog_bar.progress(0.9, text="결과 시각화 생성 중...")
+            
+            # [핵심] 세션 스테이트 저장 (날아가기 방지)
+            st.session_state['bt_p'] = p
+            st.session_state['bt_bms'] = bms
+            st.session_state['bt_res'] = res
+            st.session_state['bt_ran'] = True
+            st.session_state['last_weights'] = forced_weights
+            
+            prog_bar.progress(1.0, text="완료!")
+            time.sleep(0.3)
+            prog_bar.empty()
         else:
             st.error("데이터 수집 실패")
 
+    # [핵심] 저장된 세션이 있으면 무조건 표시 (Selectbox 바꿔도 유지됨)
+    if st.session_state.get('bt_ran'):
+        res = st.session_state['bt_res']
+        bms = st.session_state.get('bt_bms', {})
+        lw = st.session_state.get('last_weights', {})
+        preset_name = st.session_state.get('preset_select', '사용자 정의')
+        
+        if not res.empty:
+            st.info(f"✅ **적용 전략:** [{preset_name}] (추세 {lw.get('mom')} / 수급 {lw.get('liq')} / 저변동 {lw.get('vol')} / 방어 {lw.get('risk')})")
+
+            res_chart = res.set_index('Date')
+            res_chart['Cum'] = (1+res_chart['Port_Ret']).cumprod()
+            
+            mets = calculate_metrics(res_chart)
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("CAGR", f"{mets['CAGR']:.1%}")
+            m2.metric("MDD", f"{mets['MDD']:.1%}")
+            m3.metric("Sharpe", f"{mets['Sharpe']:.2f}")
+            m4.metric("Sortino", f"{mets['Sortino']:.2f}")
+            m5.metric("Win Rate", f"{mets['Win_Rate']:.1%}")
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=res_chart.index, y=res_chart['Cum'], name="Port", line=dict(width=3, color='blue')))
+            
+            if 'KOSPI' in bms:
+                try:
+                    common_idx = res_chart.index.intersection(bms['KOSPI'].index)
+                    if not common_idx.empty:
+                        b_plot = bms['KOSPI'].loc[common_idx]
+                        b_plot = b_plot / b_plot.iloc[0]
+                        fig.add_trace(go.Scatter(x=b_plot.index, y=b_plot, name='KOSPI', line=dict(dash='dot', color='red')))
+                except: pass
+                
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.divider()
+            st.subheader("📅 월별 상세 분석")
+            
+            # Selectbox가 이 안에 있어도 세션 데이터('bt_res')를 참조하므로 안전함
+            date_options = res['Date'].dt.strftime('%Y-%m-%d').tolist()
+            sel_date_str = st.selectbox("매수 시점 선택", date_options[::-1], index=0)
+            
+            if sel_date_str:
+                row = res[res['Date'] == pd.to_datetime(sel_date_str)].iloc[0]
+                codes = row['Holdings_List']
+                prices = row['Prices_Dict']
+                det = []
+                for c in codes:
+                    det.append({
+                        "종목명": TICKER_INFO.get(c, c),
+                        "코드": c,
+                        "섹터": infer_sector_kr(TICKER_INFO.get(c, c), c),
+                        "매수가(종가)": f"{prices.get(c,0):,.0f}원"
+                    })
+                st.dataframe(pd.DataFrame(det), use_container_width=True)
+                st.caption(f"※ {sel_date_str} 종가 매수 (Standard Rebalancing)")
+        else:
+            st.warning("결과 없음 (조건에 맞는 종목이 없습니다)")
+
 elif mode == "🔍 전략 최적화":
-    st.info("다양한 전략의 성과를 비교 분석합니다.")
+    st.info("모든 프리셋 전략을 비교 분석합니다.")
     st.write("") 
     if st.button("전략 비교 시작", key="btn_run_opt"):
+        prog_bar = st.progress(0, text="데이터 불러오는 중...")
         p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
         
         if not p.empty:
+            prog_bar.progress(0.2, text="시뮬레이션 준비 완료...")
             results = []
             main_bm = bms.get('KOSPI')
             if main_bm is None: main_bm = pd.Series(1.0, index=p.index)
             
-            progress_bar = st.progress(0)
-            
+            total_presets = len(PRESETS)
             for i, (name, w) in enumerate(PRESETS.items()):
                 if name == "사용자 정의": continue
-                
                 ws = {'mom': w[0], 'liq': w[1], 'vol': w[2], 'risk': w[3]}
-                res = run_backtest(p, v, ws, TICKER_INFO, CONST, benchmark=main_bm)
-                
+                res = run_backtest_logic(p, v, ws, TICKER_INFO, CONST, benchmark=main_bm)
                 if not res.empty:
                     res_c = res.set_index('Sell_Date')
                     mets = calculate_metrics(res_c)
@@ -572,9 +561,11 @@ elif mode == "🔍 전략 최적화":
                     mets['가중치'] = f"{w[0]}|{w[1]}|{w[2]}|{w[3]}"
                     results.append(mets)
                 
-                progress_bar.progress((i+1)/len(PRESETS))
+                current_prog = 0.2 + (0.7 * (i+1) / total_presets)
+                prog_bar.progress(current_prog, text=f"분석 중: {name}")
                 
             if results:
+                prog_bar.progress(0.95, text="결과 표 생성 중...")
                 res_df = pd.DataFrame(results).sort_values("CAGR", ascending=False)
                 disp_cols = ['전략명', 'CAGR', 'MDD', 'Sharpe', 'Sortino', 'Win_Rate', 'Alpha', 'Beta']
                 st.dataframe(res_df[disp_cols].style.format({
@@ -585,21 +576,9 @@ elif mode == "🔍 전략 최적화":
                 best_strat = res_df.iloc[0]['전략명']
                 st.success(f"🏆 추천 전략: {best_strat}")
                 
-                best_w_str = res_df.iloc[0]['가중치']
-                best_w_list = list(map(float, best_w_str.split('|')))
-                best_weights = {'mom': best_w_list[0], 'liq': best_w_list[1], 'vol': best_w_list[2], 'risk': best_w_list[3]}
-                
-                res_best = run_backtest(p, v, best_weights, TICKER_INFO, CONST, benchmark=main_bm)
-                if not res_best.empty:
-                    res_best = res_best.set_index('Date')
-                    res_best['Cum'] = (1+res_best['Port_Ret']).cumprod()
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=res_best.index, y=res_best['Cum'], name=best_strat, line=dict(color='#FFD700', width=2)))
-                    if 'KOSPI' in bms:
-                        b = bms['KOSPI'].reindex(res_best.index, method='ffill')
-                        b = b / b.iloc[0]
-                        fig.add_trace(go.Scatter(x=b.index, y=b, name='KOSPI', line=dict(dash='dot', color='red')))
-                    st.plotly_chart(fig, use_container_width=True)
+                prog_bar.progress(1.0, text="완료!")
+                time.sleep(0.3)
+                prog_bar.empty()
             else:
                 st.warning("결과 없음")
         else:
