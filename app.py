@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v8.7)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v8.8)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -227,12 +227,11 @@ def rank_and_score(factor_df, weights, ticker_map=None):
     return scored.sort_values(by='Total_Score', ascending=False)
 
 # ==============================================================================
-# [마켓 타이밍 로직 (Korean Optimized & Smart Trend)]
+# [마켓 타이밍 로직]
 # ==============================================================================
 def get_market_adaptive_weights(strategy_mode, benchmark_series, current_date, prev_weights=None):
     bm_slice = benchmark_series.loc[:current_date]
     
-    # 1. 초기 데이터 부족 처리
     if len(bm_slice) < 120:
         if len(bm_slice) >= 60: pass 
         else: return PRESETS["⚖️ 황금 밸런스"]
@@ -244,43 +243,29 @@ def get_market_adaptive_weights(strategy_mode, benchmark_series, current_date, p
     ma_60 = bm_slice.tail(60).mean()
     ma_120 = bm_slice.tail(120).mean()
     
-    # -----------------------------------------------------
-    # Mode 1: 한국형 VIX 스위칭 (임계값 12, 20)
-    # -----------------------------------------------------
     if strategy_mode == "VIX 변동성 스위칭":
-        if prev_weights is not None and 11 < recent_vol < 13: return prev_weights # 버퍼존
+        if prev_weights is not None and 11 < recent_vol < 13: return prev_weights
         
-        if recent_vol < 12: return PRESETS["📈 상승장 최적화"] # 공격
-        elif recent_vol < 20: return PRESETS["🐆 안전한 사냥"] # 중립
-        else: return PRESETS["📉 하락장 최적화"] # 방어 (20 넘으면 위기)
+        if recent_vol < 12: return PRESETS["📈 상승장 최적화"]
+        elif recent_vol < 20: return PRESETS["🐆 안전한 사냥"]
+        else: return PRESETS["📉 하락장 최적화"]
 
-    # -----------------------------------------------------
-    # Mode 2: Smart Trend (선행 지표 포함)
-    # -----------------------------------------------------
     elif strategy_mode == "Smart Trend (선행지표)":
-        # 1. 선행 지표 (단기 이평 이탈 감지)
-        if ma_5 < ma_20 * 0.98: # 단기가 장기를 2% 이상 하향 이탈 (급락 조짐)
-            return PRESETS["📉 하락장 최적화"] # 즉시 방어
-        elif ma_5 > ma_20 * 1.02: # 단기가 장기를 2% 이상 상향 돌파 (급등 조짐)
-            return PRESETS["📈 상승장 최적화"] # 즉시 공격
+        if ma_5 < ma_20 * 0.98: return PRESETS["📉 하락장 최적화"]
+        elif ma_5 > ma_20 * 1.02: return PRESETS["📈 상승장 최적화"]
             
-        # 2. 후행 추세 (기본 Trend)
         current_price = bm_slice.iloc[-1]
         trend_score = (current_price - ma_120) / ma_120 * 100 if ma_120 > 0 else 0
         
-        if ma_20 > ma_60 > ma_120 and trend_score > 0: 
-            return PRESETS["🌪️ 변동성 사냥꾼"]
-        elif ma_20 < ma_60 < ma_120 and trend_score < -5: 
-            return PRESETS["🏰 철벽 방어"]
-        elif abs(trend_score) < 3: 
-            return PRESETS["🌊 세력주 포착"] # 횡보장
-        else:
-            return PRESETS["🐆 안전한 사냥"]
+        if ma_20 > ma_60 > ma_120 and trend_score > 0: return PRESETS["🌪️ 변동성 사냥꾼"]
+        elif ma_20 < ma_60 < ma_120 and trend_score < -5: return PRESETS["🏰 철벽 방어"]
+        elif abs(trend_score) < 3: return PRESETS["🌊 세력주 포착"]
+        else: return PRESETS["🐆 안전한 사냥"]
 
     return PRESETS["⚖️ 황금 밸런스"]
 
 # ==============================================================================
-# [백테스트 엔진 (Cost Logic Fixed)]
+# [백테스트 엔진]
 # ==============================================================================
 def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=None, strategy_mode="Fixed"):
     if prices.empty: return pd.DataFrame()
@@ -363,7 +348,6 @@ def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=
             ret_vec = ret_vec.fillna(0)
             gross_ret = ret_vec.mean()
             
-            # [수정] 회전율(Turnover) 계산 복구
             if not prev_picks: 
                 turnover = 1.0
             else:
@@ -382,7 +366,6 @@ def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=
                     s_costs.append(calculate_slippage(target_amt_per_stock, avg_v))
             avg_slippage = np.mean(s_costs) if s_costs else 0.002
             
-            # [수정] 비용에 회전율 반영 (Cost Logic Fix)
             total_cost = (CONST['COST_RATE'] + avg_slippage) * turnover
             net_ret = gross_ret - total_cost
             
@@ -405,7 +388,7 @@ def run_backtest(prices, volumes, initial_weights, ticker_map, const, benchmark=
                 'Port_Ret': net_ret,
                 'Used_Weights': current_weights 
             })
-            prev_picks = picks # picks 업데이트 필수
+            prev_picks = picks
             
         except: continue
             
@@ -448,9 +431,15 @@ def calculate_metrics(res_df):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v8.7)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v8.8)")
+
+# [핵심] 상태 초기화 함수 (설정 변경 시 호출)
+def reset_results():
+    st.session_state['bt_ran'] = False
+    st.session_state['bt_res'] = pd.DataFrame()
 
 def update_sliders():
+    # 1. 프리셋 값으로 슬라이더 업데이트
     ps = st.session_state['preset_select']
     if ps in PRESETS:
         vals = PRESETS[ps]
@@ -458,12 +447,20 @@ def update_sliders():
         st.session_state['slider_liq'] = vals[1]
         st.session_state['slider_vol'] = vals[2]
         st.session_state['slider_risk'] = vals[3]
+    
+    # 2. 결과 초기화 (화면 클리어)
+    reset_results()
+
+def on_slider_change():
+    # 슬라이더 건드리면 "사용자 정의"로 변경하고 결과 초기화
+    # (여기서는 프리셋 이름을 바꾸진 않지만 결과는 지움)
+    reset_results()
 
 c_d1, c_d2 = st.columns(2)
 with c_d1: 
-    s_d = st.date_input("분석 시작일", CONST['DEFAULT_START_DATE'], key="start_date_common")
+    s_d = st.date_input("분석 시작일", CONST['DEFAULT_START_DATE'], key="start_date_common", on_change=reset_results)
 with c_d2: 
-    e_d = st.date_input("분석 종료일", get_last_complete_month_end(), key="end_date_common")
+    e_d = st.date_input("분석 종료일", get_last_complete_month_end(), key="end_date_common", on_change=reset_results)
 
 with st.sidebar:
     st.info("대상: KOSPI/KOSDAQ 유동성 상위 300개")
@@ -472,11 +469,11 @@ with st.sidebar:
     if st.button("🧹 캐시 초기화", key="clear_cache"): st.cache_data.clear(); st.rerun()
     st.divider()
     
-    mode = st.radio("모드 선택", ["📉 백테스트", "🔍 전략 최적화"], key="mode_radio")
+    mode = st.radio("모드 선택", ["📉 백테스트", "🔍 전략 최적화"], key="mode_radio", on_change=reset_results)
     st.divider()
     
     if mode == "📉 백테스트":
-        strategy_type = st.radio("전략 운용 방식", ["고정 가중치 (Fixed)", "VIX 변동성 스위칭", "Smart Trend (선행지표)"])
+        strategy_type = st.radio("전략 운용 방식", ["고정 가중치 (Fixed)", "VIX 변동성 스위칭", "Smart Trend (선행지표)"], on_change=reset_results)
         
         if strategy_type == "고정 가중치 (Fixed)":
             sel_preset = st.selectbox("전략 프리셋", list(PRESETS.keys()), index=9, key="preset_select", on_change=update_sliders)
@@ -488,10 +485,11 @@ with st.sidebar:
                 st.session_state['slider_vol'] = init_vals[2]
                 st.session_state['slider_risk'] = init_vals[3]
 
-            w_mom = st.slider("📈 추세", 0.0, 1.0, key="slider_mom", step=0.1)
-            w_liq = st.slider("🌊 수급", 0.0, 1.0, key="slider_liq", step=0.1)
-            w_vol = st.slider("⚖️ 저변동", 0.0, 1.0, key="slider_vol", step=0.1)
-            w_risk = st.slider("🛡️ 방어", 0.0, 1.0, key="slider_risk", step=0.1)
+            # 슬라이더에 on_change 추가
+            w_mom = st.slider("📈 추세", 0.0, 1.0, key="slider_mom", step=0.1, on_change=on_slider_change)
+            w_liq = st.slider("🌊 수급", 0.0, 1.0, key="slider_liq", step=0.1, on_change=on_slider_change)
+            w_vol = st.slider("⚖️ 저변동", 0.0, 1.0, key="slider_vol", step=0.1, on_change=on_slider_change)
+            w_risk = st.slider("🛡️ 방어", 0.0, 1.0, key="slider_risk", step=0.1, on_change=on_slider_change)
             weights = {'mom': w_mom, 'liq': w_liq, 'vol': w_vol, 'risk': w_risk}
         else:
             st.info(f"💡 시장(KOSPI) 상황에 맞춰\n매월 최적의 전략으로 자동 전환합니다.\n\n선택 모드: {strategy_type}")
@@ -569,7 +567,7 @@ if mode == "📉 백테스트":
                 comp_results.append(m)
 
             st.session_state['comp_results'] = pd.DataFrame(comp_results).sort_values('CAGR', ascending=False)
-            st.session_state['bt_res'] = res_trend # 차트는 스마트 트렌드 기준
+            st.session_state['bt_res'] = res_trend 
             st.session_state['bt_p'] = p
             st.session_state['bt_bms'] = bms
             st.session_state['bt_ran'] = True
