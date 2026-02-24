@@ -5,14 +5,31 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import logging
 import time
+import sys
+import subprocess
 
-# [중요] 라이브러리 로딩 확인
+# [비기] 라이브러리 강제 설치 함수
+def install(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# pykrx 불러오기 시도 -> 실패하면 즉시 설치 -> 다시 불러오기
 try:
     from pykrx import stock
     USE_PYKRX = True
 except ImportError:
-    st.error("❌ pykrx 라이브러리가 설치되지 않았습니다. requirements.txt에 'pykrx'를 추가해주세요.")
-    st.stop()
+    try:
+        # 화면에 설치 중임을 표시
+        with st.spinner("⚠️ pykrx 라이브러리 설치 중... (약 15~30초 소요)"):
+            install("pykrx")
+            install("finance-datareader") # 혹시 몰라 같이 설치
+            from pykrx import stock
+        st.success("✅ 설치가 완료되었습니다! 앱이 곧 실행됩니다.")
+        USE_PYKRX = True
+        time.sleep(1) # 메시지 보여줄 시간 확보
+        st.rerun() # 새로고침해서 라이브러리 로드
+    except Exception as e:
+        st.error(f"❌ 설치 실패: {e}")
+        st.stop()
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
