@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v9.5)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v9.6)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -104,7 +104,7 @@ def infer_sector_kr(name, code=None):
     return '기타/소형주'
 
 # ==============================================================================
-# [데이터 로더] - (안정화 Retry 적용)
+# [데이터 로더] - (무결성 검증 추가)
 # ==============================================================================
 @st.cache_data(ttl=3600*12)
 def load_kr_data():
@@ -131,26 +131,35 @@ def fetch_data_serial(universe, start_date, end_date):
     e_str = end_date.strftime('%Y-%m-%d')
     
     p_dict, v_dict, bm_dict = {}, {}, {}
+    success_count = 0
+    fail_count = 0
     
-    # 벤치마크 (Retry)
-    for _ in range(3):
-        try:
-            kospi = fdr.DataReader('KS11', s_str, e_str)
-            if not kospi.empty: 
-                bm_dict['KOSPI'] = kospi['Close']
-                break
-        except: time.sleep(0.5)
+    # 벤치마크 (Retry + Fail Safe)
+    try:
+        for _ in range(3):
+            try:
+                kospi = fdr.DataReader('KS11', s_str, e_str)
+                if not kospi.empty: 
+                    bm_dict['KOSPI'] = kospi['Close']
+                    break
+            except: time.sleep(0.5)
+    except: pass
     
-    # 개별 종목 (Retry)
+    # 개별 종목
     for i, code in enumerate(universe):
+        fetched = False
         for _ in range(3):
             try:
                 d = fdr.DataReader(code, s_str, e_str)
                 if len(d) > 60 and d['Close'].iloc[-1] > 0:
                     if 'Close' in d.columns: p_dict[code] = d['Close']
                     if 'Volume' in d.columns: v_dict[code] = d['Volume']
+                    fetched = True
                 break
             except: time.sleep(0.2)
+        
+        if fetched: success_count += 1
+        else: fail_count += 1
             
     df_p = pd.DataFrame(p_dict)
     df_v = pd.DataFrame(v_dict)
@@ -162,7 +171,7 @@ def fetch_data_serial(universe, start_date, end_date):
         for k in bm_dict:
             bm_dict[k] = bm_dict[k].reindex(full_idx).ffill()
             
-    return df_p, df_v, bm_dict
+    return df_p, df_v, bm_dict, success_count, fail_count
 
 # ==============================================================================
 # [Core Logic]
@@ -170,7 +179,6 @@ def fetch_data_serial(universe, start_date, end_date):
 def calculate_factors(price, volume, min_amt, trading_days=252):
     if len(price) < 120 or price.iloc[-1] == 0 or np.isnan(price.iloc[-1]): return None
     
-    # 거래정지 필터
     zero_volume_days = (volume.tail(20) == 0).sum()
     if zero_volume_days >= 3: return None 
 
@@ -227,12 +235,12 @@ def rank_and_score(factor_df, weights, ticker_map=None):
         scored['Z_MDD'] * weights['risk']
     )
     
-    # [안정화] 정렬 순서 고정 (Deterministic Sort)
+    # 안정화 정렬
     scored = scored.sort_index() 
     return scored.sort_values(by='Total_Score', ascending=False)
 
 # ==============================================================================
-# [백테스트 엔진] - (진행바 UI 연동용 yield 구조 아님, 외부에서 제어)
+# [백테스트 엔진]
 # ==============================================================================
 def run_backtest_logic(prices, volumes, weights, ticker_map, const, benchmark=None):
     if prices.empty: return pd.DataFrame()
@@ -242,12 +250,13 @@ def run_backtest_logic(prices, volumes, weights, ticker_map, const, benchmark=No
     prev_picks = [] 
     target_n = CONST['TOP_N'] 
     
+    # [수정] 벤치마크 안전장치 (Alignment)
     if benchmark is None or benchmark.empty:
         benchmark = pd.Series(1.0, index=prices.index)
     else:
+        # 벤치마크 날짜를 포트폴리오 날짜에 강제 맞춤 (결측치 방지)
         benchmark = benchmark.reindex(prices.index).ffill().fillna(method='bfill')
 
-    # 시작일 보정
     start_idx = 0
     for i, d in enumerate(reb_dates):
         if d >= prices.index[0] + timedelta(days=120): 
@@ -323,15 +332,20 @@ def run_backtest_logic(prices, volumes, weights, ticker_map, const, benchmark=No
                     s_costs.append(calculate_slippage(target_amt_per_stock, avg_v))
             avg_slippage = np.mean(s_costs) if s_costs else 0.002
             
-            total_cost = (CONST['COST_RATE'] + avg_slippage) * turnover
+            total_cost = (const['COST_RATE'] + avg_slippage) * turnover
             net_ret = gross_ret - total_cost
             
+            # 벤치마크 계산 (Safeguard)
             try:
                 b_s = benchmark.asof(buy_date)
                 b_e = benchmark.asof(sell_date)
                 val_s = b_s.iloc[0] if isinstance(b_s, pd.Series) else b_s
                 val_e = b_e.iloc[0] if isinstance(b_e, pd.Series) else b_e
-                bm_ret = (val_e / val_s) - 1 if val_s != 0 else 0.0
+                
+                if val_s != 0 and not np.isnan(val_s):
+                    bm_ret = (val_e / val_s) - 1
+                else:
+                    bm_ret = 0.0
             except: bm_ret = 0.0
                 
             logs.append({
@@ -340,11 +354,12 @@ def run_backtest_logic(prices, volumes, weights, ticker_map, const, benchmark=No
                 'Gross_Ret': gross_ret, 
                 'Net_Ret': net_ret,
                 'BM_Ret': bm_ret, 
+                'Turnover': turnover,
                 'Holdings_List': picks, 
                 'Prices_Dict': current_prices, 
                 'Port_Ret': net_ret
             })
-            prev_picks = picks 
+            prev_picks = picks
             
         except: continue
             
@@ -389,9 +404,8 @@ def calculate_metrics(res_df):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v9.5)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v9.6)")
 
-# [복구] 상태 초기화 (입력 변경 시)
 def reset_results():
     st.session_state['bt_ran'] = False
     st.session_state['bt_res'] = pd.DataFrame()
@@ -443,7 +457,6 @@ with st.sidebar:
 if mode == "📉 백테스트":
     st.write("") 
     if st.button("실행", type="primary", key="btn_run_backtest"):
-        # [핵심] Force Injection
         forced_weights = {
             'mom': st.session_state['slider_mom'],
             'liq': st.session_state['slider_liq'],
@@ -451,20 +464,26 @@ if mode == "📉 백테스트":
             'risk': st.session_state['slider_risk']
         }
 
-        # [복구] 매끄러운 진행바
         prog_bar = st.progress(0, text="데이터 불러오는 중...")
-        p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
+        # [변경] 성공/실패 카운트 반환 받음
+        p, v, bms, succ, fail = fetch_data_serial(ALL_STOCKS, s_d, e_d)
+        
+        # [결과 리포트]
+        st.caption(f"📊 데이터 수집 결과: 성공 {succ}개 / 실패 {fail}개")
+        if succ < 50:
+            st.error("⚠️ 데이터 수집 실패율이 너무 높습니다. 네트워크 상태를 확인하거나 잠시 후 다시 시도해주세요.")
         
         if not p.empty:
             prog_bar.progress(0.3, text="백테스트 엔진 가동 중...")
             main_bm = bms.get('KOSPI')
-            if main_bm is None: main_bm = pd.Series(1.0, index=p.index)
+            if main_bm is None: 
+                st.warning("⚠️ 벤치마크(KOSPI) 데이터를 불러오지 못했습니다. 시장 비교 기능이 제한될 수 있습니다.")
+                main_bm = pd.Series(1.0, index=p.index)
             
             res = run_backtest_logic(p, v, forced_weights, TICKER_INFO, CONST, benchmark=main_bm)
             
             prog_bar.progress(0.9, text="결과 시각화 생성 중...")
             
-            # [핵심] 세션 스테이트 저장 (날아가기 방지)
             st.session_state['bt_p'] = p
             st.session_state['bt_bms'] = bms
             st.session_state['bt_res'] = res
@@ -477,7 +496,6 @@ if mode == "📉 백테스트":
         else:
             st.error("데이터 수집 실패")
 
-    # [핵심] 저장된 세션이 있으면 무조건 표시 (Selectbox 바꿔도 유지됨)
     if st.session_state.get('bt_ran'):
         res = st.session_state['bt_res']
         bms = st.session_state.get('bt_bms', {})
@@ -515,7 +533,6 @@ if mode == "📉 백테스트":
             st.divider()
             st.subheader("📅 월별 상세 분석")
             
-            # Selectbox가 이 안에 있어도 세션 데이터('bt_res')를 참조하므로 안전함
             date_options = res['Date'].dt.strftime('%Y-%m-%d').tolist()
             sel_date_str = st.selectbox("매수 시점 선택", date_options[::-1], index=0)
             
@@ -541,7 +558,7 @@ elif mode == "🔍 전략 최적화":
     st.write("") 
     if st.button("전략 비교 시작", key="btn_run_opt"):
         prog_bar = st.progress(0, text="데이터 불러오는 중...")
-        p, v, bms = fetch_data_serial(ALL_STOCKS, s_d, e_d)
+        p, v, bms, succ, fail = fetch_data_serial(ALL_STOCKS, s_d, e_d)
         
         if not p.empty:
             prog_bar.progress(0.2, text="시뮬레이션 준비 완료...")
