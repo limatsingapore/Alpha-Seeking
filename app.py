@@ -5,20 +5,10 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import logging
 import time
-
-# --- [로그 설정] ---
-logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
+import sys
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v10.3)", layout="wide", initial_sidebar_state="expanded")
-
-# [라이브러리 로딩]
-try:
-    from pykrx import stock
-    USE_PYKRX = True
-except ImportError:
-    st.error("❌ 라이브러리 로딩 실패. 1) Python 버전을 3.10으로 설정했는지, 2) requirements.txt에 pykrx와 setuptools가 있는지 확인해주세요.")
-    st.stop()
+st.set_page_config(page_title="Alpha Seeking Pro (v10.4 Debug)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -31,6 +21,28 @@ st.markdown("""
     .stProgress { margin-top: 20px; margin-bottom: 20px; }
     </style>
     """, unsafe_allow_html=True)
+
+# ==============================================================================
+# [라이브러리 로딩 및 디버깅]
+# ==============================================================================
+try:
+    from pykrx import stock
+    USE_PYKRX = True
+except ImportError as e:
+    st.error("❌ 치명적 오류: pykrx 라이브러리 로딩 실패")
+    
+    # [디버깅] 상세 에러 메시지 출력
+    st.code(f"Error Details: {e}", language="bash")
+    st.warning("""
+    [해결 가이드]
+    1. GitHub의 'requirements.txt' 파일에 'pykrx'와 'lxml'이 있는지 확인하세요.
+    2. Streamlit Cloud 설정에서 Python Version이 '3.10'인지 확인하세요.
+    3. 위 2가지가 맞다면, 앱을 'Delete' 하고 다시 'New app'으로 배포해보세요.
+    """)
+    st.stop()
+
+# --- [로그 설정] ---
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # ==============================================================================
 # [상수 및 설정]
@@ -417,7 +429,7 @@ def calculate_metrics(res_df):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v10.3)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v10.4)")
 
 def reset_results():
     st.session_state['bt_ran'] = False
