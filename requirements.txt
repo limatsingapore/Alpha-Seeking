@@ -3,6 +3,6 @@ pandas
 numpy
 plotly
 finance-datareader
-pykrx>=1.0.40
+pykrx>=1.0.46
 requests
-lxml
+# force rebuild v1
