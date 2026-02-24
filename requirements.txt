@@ -3,6 +3,6 @@ pandas
 numpy
 plotly
 finance-datareader
-pykrx>=1.0.46
+pykrx
 requests
-# force rebuild v1
+setuptools
