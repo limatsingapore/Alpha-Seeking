@@ -6,3 +6,4 @@ finance-datareader
 pykrx
 requests
 setuptools
+lxml
