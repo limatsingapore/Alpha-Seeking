@@ -11,7 +11,7 @@ import time
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v9.6)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Debug v9.7)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -104,7 +104,7 @@ def infer_sector_kr(name, code=None):
     return '기타/소형주'
 
 # ==============================================================================
-# [데이터 로더] - (무결성 검증 추가)
+# [데이터 로더] - (디버깅 모드 적용)
 # ==============================================================================
 @st.cache_data(ttl=3600*12)
 def load_kr_data():
@@ -121,7 +121,8 @@ def load_kr_data():
         else:
             df = df.head(300) 
         return df.set_index('Code')['Name'].to_dict(), df['Code'].tolist()
-    except:
+    except Exception as e:
+        st.error(f"종목 리스트 로딩 실패: {e}")
         return {"005930":"삼성전자"}, ["005930"]
 
 @st.cache_data(ttl=3600*24)
@@ -133,36 +134,37 @@ def fetch_data_serial(universe, start_date, end_date):
     p_dict, v_dict, bm_dict = {}, {}, {}
     success_count = 0
     fail_count = 0
+    last_error = None
     
-    # 벤치마크 (Retry + Fail Safe)
+    # 벤치마크
     try:
-        for _ in range(3):
-            try:
-                kospi = fdr.DataReader('KS11', s_str, e_str)
-                if not kospi.empty: 
-                    bm_dict['KOSPI'] = kospi['Close']
-                    break
-            except: time.sleep(0.5)
-    except: pass
+        kospi = fdr.DataReader('KS11', s_str, e_str)
+        if not kospi.empty: bm_dict['KOSPI'] = kospi['Close']
+    except Exception as e:
+        st.warning(f"벤치마크(KOSPI) 수집 실패: {e}")
     
     # 개별 종목
     for i, code in enumerate(universe):
         fetched = False
-        for _ in range(3):
-            try:
-                d = fdr.DataReader(code, s_str, e_str)
-                if len(d) > 60 and d['Close'].iloc[-1] > 0:
-                    if 'Close' in d.columns: p_dict[code] = d['Close']
-                    if 'Volume' in d.columns: v_dict[code] = d['Volume']
-                    fetched = True
-                break
-            except: time.sleep(0.2)
-        
+        try:
+            d = fdr.DataReader(code, s_str, e_str)
+            if len(d) > 60 and d['Close'].iloc[-1] > 0:
+                if 'Close' in d.columns: p_dict[code] = d['Close']
+                if 'Volume' in d.columns: v_dict[code] = d['Volume']
+                fetched = True
+        except Exception as e:
+            last_error = str(e)
+            
         if fetched: success_count += 1
         else: fail_count += 1
             
     df_p = pd.DataFrame(p_dict)
     df_v = pd.DataFrame(v_dict)
+    
+    # [디버깅] 실패 원인 출력
+    if success_count == 0 and fail_count > 0:
+        st.error(f"❌ 모든 데이터 수집 실패! 마지막 에러: {last_error}")
+        st.warning("팁: FinanceDataReader 버전을 업데이트하거나, 네트워크 상태를 확인하세요.")
     
     if not df_p.empty:
         full_idx = pd.date_range(start=df_p.index.min(), end=df_p.index.max(), freq='B')
@@ -235,7 +237,6 @@ def rank_and_score(factor_df, weights, ticker_map=None):
         scored['Z_MDD'] * weights['risk']
     )
     
-    # 안정화 정렬
     scored = scored.sort_index() 
     return scored.sort_values(by='Total_Score', ascending=False)
 
@@ -250,11 +251,9 @@ def run_backtest_logic(prices, volumes, weights, ticker_map, const, benchmark=No
     prev_picks = [] 
     target_n = CONST['TOP_N'] 
     
-    # [수정] 벤치마크 안전장치 (Alignment)
     if benchmark is None or benchmark.empty:
         benchmark = pd.Series(1.0, index=prices.index)
     else:
-        # 벤치마크 날짜를 포트폴리오 날짜에 강제 맞춤 (결측치 방지)
         benchmark = benchmark.reindex(prices.index).ffill().fillna(method='bfill')
 
     start_idx = 0
@@ -335,7 +334,6 @@ def run_backtest_logic(prices, volumes, weights, ticker_map, const, benchmark=No
             total_cost = (const['COST_RATE'] + avg_slippage) * turnover
             net_ret = gross_ret - total_cost
             
-            # 벤치마크 계산 (Safeguard)
             try:
                 b_s = benchmark.asof(buy_date)
                 b_e = benchmark.asof(sell_date)
@@ -404,7 +402,7 @@ def calculate_metrics(res_df):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v9.6)")
+st.title("🇰🇷 Alpha Seeking Pro (Debug v9.7)")
 
 def reset_results():
     st.session_state['bt_ran'] = False
@@ -465,19 +463,18 @@ if mode == "📉 백테스트":
         }
 
         prog_bar = st.progress(0, text="데이터 불러오는 중...")
-        # [변경] 성공/실패 카운트 반환 받음
         p, v, bms, succ, fail = fetch_data_serial(ALL_STOCKS, s_d, e_d)
         
-        # [결과 리포트]
+        # 결과 리포팅
         st.caption(f"📊 데이터 수집 결과: 성공 {succ}개 / 실패 {fail}개")
         if succ < 50:
-            st.error("⚠️ 데이터 수집 실패율이 너무 높습니다. 네트워크 상태를 확인하거나 잠시 후 다시 시도해주세요.")
+            st.error("⚠️ 데이터 수집 실패율이 너무 높습니다.")
         
         if not p.empty:
             prog_bar.progress(0.3, text="백테스트 엔진 가동 중...")
             main_bm = bms.get('KOSPI')
             if main_bm is None: 
-                st.warning("⚠️ 벤치마크(KOSPI) 데이터를 불러오지 못했습니다. 시장 비교 기능이 제한될 수 있습니다.")
+                st.warning("⚠️ 벤치마크(KOSPI) 데이터 없음. 시장 비교 기능 제한.")
                 main_bm = pd.Series(1.0, index=p.index)
             
             res = run_backtest_logic(p, v, forced_weights, TICKER_INFO, CONST, benchmark=main_bm)
