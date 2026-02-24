@@ -6,12 +6,12 @@ import plotly.graph_objects as go
 import logging
 import time
 
-# [중요] FinanceDataReader 대신 pykrx 사용
+# [중요] 라이브러리 로딩 확인
 try:
     from pykrx import stock
     USE_PYKRX = True
 except ImportError:
-    st.error("❌ pykrx 라이브러리가 없습니다. 터미널에서 'pip install pykrx'를 실행해주세요.")
+    st.error("❌ pykrx 라이브러리가 설치되지 않았습니다. requirements.txt에 'pykrx'를 추가해주세요.")
     st.stop()
 
 # --- [로그 설정] ---
@@ -138,15 +138,15 @@ def load_kr_data_pykrx():
         top_codes = []
         
         for code in df_top300.index:
-            name = stock.get_market_ticker_name(code)
-            # 스팩, 우선주 제외
-            if any(x in name for x in ['스팩', '우', '우B', '리츠', '홀딩스']):
-                continue
-            ticker_dict[code] = name
-            top_codes.append(code)
+            try:
+                name = stock.get_market_ticker_name(code)
+                # 스팩, 우선주 제외
+                if any(x in name for x in ['스팩', '우', '우B', '리츠', '홀딩스']):
+                    continue
+                ticker_dict[code] = name
+                top_codes.append(code)
+            except: pass
             
-        # 300개 맞추기 위해 넉넉히 가져왔다가 필터링 후 짤림 방지
-        # 여기서는 간단히 필터링된 리스트 반환
         return ticker_dict, top_codes
 
     except Exception as e:
@@ -156,6 +156,7 @@ def load_kr_data_pykrx():
 @st.cache_data(ttl=3600*24)
 def fetch_data_pykrx(universe, start_date, end_date):
     # 날짜 포맷 변환 (pykrx는 YYYYMMDD 문자열 필요)
+    # 데이터를 넉넉히 가져옴 (이평선 계산 등 위해)
     real_start = start_date - timedelta(days=400)
     s_str = real_start.strftime("%Y%m%d")
     e_str = end_date.strftime("%Y%m%d")
@@ -175,7 +176,6 @@ def fetch_data_pykrx(universe, start_date, end_date):
         pass
 
     # 2. 개별 종목 데이터
-    # 진행바
     progress_bar = st.progress(0, text="KRX 데이터 수집 중... (0%)")
     total = len(universe)
     
@@ -185,9 +185,7 @@ def fetch_data_pykrx(universe, start_date, end_date):
             # pykrx는 '종가', '거래량' 등의 한글 컬럼을 반환함
             df = stock.get_market_ohlcv_by_date(s_str, e_str, code)
             
-            # 수정주가 적용 (pykrx는 기본적으로 수정주가 반영됨, 다만 adjust=True 명시 가능)
-            # default가 adjusted price임.
-            
+            # 수정주가 적용 (pykrx는 기본적으로 수정주가 반영됨)
             if not df.empty and len(df) > 60:
                 p_dict[code] = df['종가']
                 v_dict[code] = df['거래량']
