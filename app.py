@@ -4,14 +4,21 @@ import numpy as np
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import logging
-import FinanceDataReader as fdr
 import time
+
+# [중요] FinanceDataReader 대신 pykrx 사용
+try:
+    from pykrx import stock
+    USE_PYKRX = True
+except ImportError:
+    st.error("❌ pykrx 라이브러리가 없습니다. 터미널에서 'pip install pykrx'를 실행해주세요.")
+    st.stop()
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Debug v9.7)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (v10.0 Pykrx)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -40,9 +47,6 @@ CONST = {
     'TOP_N': 20 
 }
 
-# ==============================================================================
-# [프리셋 정의]
-# ==============================================================================
 PRESETS = {
     "사용자 정의": (0.5, 0.5, 0.5, 0.5), "🔥 야수의 심장": (1.0, 1.0, 0.0, 0.0),
     "🚀 달리는 말": (1.0, 0.5, 0.2, 0.3), "🌊 세력주 포착": (0.4, 1.0, 0.2, 0.2),
@@ -81,7 +85,6 @@ def infer_sector_kr(name, code=None):
         '105560': '금융/지주', '055550': '금융/지주'
     }
     if code and code in exact_mapping: return exact_mapping[code]
-
     name = str(name)
     if any(x in name for x in ['스팩', '제호', '기업인수']): return '스팩/금융'
     if any(x in name for x in ['우', '우B']): return '우선주'
@@ -104,74 +107,113 @@ def infer_sector_kr(name, code=None):
     return '기타/소형주'
 
 # ==============================================================================
-# [데이터 로더] - (디버깅 모드 적용)
+# [데이터 로더 - pykrx 최적화 버전]
 # ==============================================================================
 @st.cache_data(ttl=3600*12)
-def load_kr_data():
+def load_kr_data_pykrx():
     try:
-        df = fdr.StockListing('KRX')
-        if df.empty: raise ValueError("KRX Empty")
-        if 'Symbol' in df.columns: df.rename(columns={'Symbol':'Code'}, inplace=True)
-        df = df[~df['Name'].str.contains('스팩|우B|우|리츠|홀딩스', na=False)]
+        # [최적화] 오늘 기준 시가총액 상위 종목을 한 번에 가져옴 (속도 매우 빠름)
+        today = datetime.now().strftime("%Y%m%d")
+        # 장이 안 열린 날일 수 있으니 최근 평일 탐색
+        for _ in range(5):
+            try:
+                # KOSPI + KOSDAQ 시가총액 데이터
+                df_kospi = stock.get_market_cap(today, market="KOSPI")
+                df_kosdaq = stock.get_market_cap(today, market="KOSDAQ")
+                
+                if not df_kospi.empty:
+                    break
+            except:
+                today = (datetime.strptime(today, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
         
-        if 'Amount' in df.columns:
-            df = df.sort_values('Amount', ascending=False).head(300) 
-        elif 'Marcap' in df.columns:
-            df = df.sort_values('Marcap', ascending=False).head(300)
-        else:
-            df = df.head(300) 
-        return df.set_index('Code')['Name'].to_dict(), df['Code'].tolist()
+        # 합치기
+        df_total = pd.concat([df_kospi, df_kosdaq])
+        
+        # 시가총액 상위 300개 선정
+        df_top300 = df_total.sort_values(by='시가총액', ascending=False).head(300)
+        
+        # 종목명 딕셔너리 생성 (pykrx는 데이터프레임 인덱스가 티커임)
+        # 005930 -> 삼성전자
+        ticker_dict = {}
+        top_codes = []
+        
+        for code in df_top300.index:
+            name = stock.get_market_ticker_name(code)
+            # 스팩, 우선주 제외
+            if any(x in name for x in ['스팩', '우', '우B', '리츠', '홀딩스']):
+                continue
+            ticker_dict[code] = name
+            top_codes.append(code)
+            
+        # 300개 맞추기 위해 넉넉히 가져왔다가 필터링 후 짤림 방지
+        # 여기서는 간단히 필터링된 리스트 반환
+        return ticker_dict, top_codes
+
     except Exception as e:
-        st.error(f"종목 리스트 로딩 실패: {e}")
+        st.error(f"pykrx 종목 로딩 실패: {e}")
         return {"005930":"삼성전자"}, ["005930"]
 
 @st.cache_data(ttl=3600*24)
-def fetch_data_serial(universe, start_date, end_date):
-    real_start_date = start_date - timedelta(days=400)
-    s_str = real_start_date.strftime('%Y-%m-%d')
-    e_str = end_date.strftime('%Y-%m-%d')
+def fetch_data_pykrx(universe, start_date, end_date):
+    # 날짜 포맷 변환 (pykrx는 YYYYMMDD 문자열 필요)
+    real_start = start_date - timedelta(days=400)
+    s_str = real_start.strftime("%Y%m%d")
+    e_str = end_date.strftime("%Y%m%d")
     
-    p_dict, v_dict, bm_dict = {}, {}, {}
+    p_dict = {}
+    v_dict = {}
     success_count = 0
     fail_count = 0
-    last_error = None
     
-    # 벤치마크
+    # 1. 벤치마크 (KOSPI 지수)
+    bm_dict = {}
     try:
-        kospi = fdr.DataReader('KS11', s_str, e_str)
-        if not kospi.empty: bm_dict['KOSPI'] = kospi['Close']
-    except Exception as e:
-        st.warning(f"벤치마크(KOSPI) 수집 실패: {e}")
+        # 1001: 코스피 지수
+        kospi_df = stock.get_index_ohlcv_by_date(s_str, e_str, "1001")
+        bm_dict['KOSPI'] = kospi_df['종가']
+    except:
+        pass
+
+    # 2. 개별 종목 데이터
+    # 진행바
+    progress_bar = st.progress(0, text="KRX 데이터 수집 중... (0%)")
+    total = len(universe)
     
-    # 개별 종목
     for i, code in enumerate(universe):
         fetched = False
         try:
-            d = fdr.DataReader(code, s_str, e_str)
-            if len(d) > 60 and d['Close'].iloc[-1] > 0:
-                if 'Close' in d.columns: p_dict[code] = d['Close']
-                if 'Volume' in d.columns: v_dict[code] = d['Volume']
+            # pykrx는 '종가', '거래량' 등의 한글 컬럼을 반환함
+            df = stock.get_market_ohlcv_by_date(s_str, e_str, code)
+            
+            # 수정주가 적용 (pykrx는 기본적으로 수정주가 반영됨, 다만 adjust=True 명시 가능)
+            # default가 adjusted price임.
+            
+            if not df.empty and len(df) > 60:
+                p_dict[code] = df['종가']
+                v_dict[code] = df['거래량']
                 fetched = True
-        except Exception as e:
-            last_error = str(e)
+        except:
+            pass
             
         if fetched: success_count += 1
         else: fail_count += 1
+        
+        if i % 10 == 0:
+            progress_bar.progress((i+1)/total, text=f"KRX 데이터 수집 중... ({i+1}/{total})")
             
+    progress_bar.empty()
+    
     df_p = pd.DataFrame(p_dict)
     df_v = pd.DataFrame(v_dict)
     
-    # [디버깅] 실패 원인 출력
-    if success_count == 0 and fail_count > 0:
-        st.error(f"❌ 모든 데이터 수집 실패! 마지막 에러: {last_error}")
-        st.warning("팁: FinanceDataReader 버전을 업데이트하거나, 네트워크 상태를 확인하세요.")
-    
+    # 인덱스(날짜) 통일 및 빈 구멍 채우기
     if not df_p.empty:
         full_idx = pd.date_range(start=df_p.index.min(), end=df_p.index.max(), freq='B')
         df_p = df_p.reindex(full_idx).ffill()
         df_v = df_v.reindex(full_idx).fillna(0)
-        for k in bm_dict:
-            bm_dict[k] = bm_dict[k].reindex(full_idx).ffill()
+        
+        if 'KOSPI' in bm_dict:
+            bm_dict['KOSPI'] = bm_dict['KOSPI'].reindex(full_idx).ffill()
             
     return df_p, df_v, bm_dict, success_count, fail_count
 
@@ -268,7 +310,6 @@ def run_backtest_logic(prices, volumes, weights, ticker_map, const, benchmark=No
         rebal_date = reb_dates[i] 
         if i < len(reb_dates) - 1: next_rebal = reb_dates[i+1]
         else: next_rebal = prices.index[-1]
-        
         if rebal_date > prices.index[-1]: break
             
         try:
@@ -402,7 +443,7 @@ def calculate_metrics(res_df):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Debug v9.7)")
+st.title("🇰🇷 Alpha Seeking Pro (v10.0 Pykrx Edition)")
 
 def reset_results():
     st.session_state['bt_ran'] = False
@@ -428,8 +469,9 @@ with c_d2:
     e_d = st.date_input("분석 종료일", get_last_complete_month_end(), key="end_date_common", on_change=reset_results)
 
 with st.sidebar:
-    st.info("대상: KOSPI/KOSDAQ 유동성 상위 300개")
-    TICKER_INFO, ALL_STOCKS = load_kr_data()
+    st.info("대상: KOSPI/KOSDAQ 시가총액 상위 300개 (pykrx Source)")
+    # pykrx 로더 호출
+    TICKER_INFO, ALL_STOCKS = load_kr_data_pykrx()
             
     if st.button("🧹 캐시 초기화", key="clear_cache"): st.cache_data.clear(); st.rerun()
     st.divider()
@@ -463,9 +505,9 @@ if mode == "📉 백테스트":
         }
 
         prog_bar = st.progress(0, text="데이터 불러오는 중...")
-        p, v, bms, succ, fail = fetch_data_serial(ALL_STOCKS, s_d, e_d)
+        # pykrx 페처 호출
+        p, v, bms, succ, fail = fetch_data_pykrx(ALL_STOCKS, s_d, e_d)
         
-        # 결과 리포팅
         st.caption(f"📊 데이터 수집 결과: 성공 {succ}개 / 실패 {fail}개")
         if succ < 50:
             st.error("⚠️ 데이터 수집 실패율이 너무 높습니다.")
@@ -555,7 +597,7 @@ elif mode == "🔍 전략 최적화":
     st.write("") 
     if st.button("전략 비교 시작", key="btn_run_opt"):
         prog_bar = st.progress(0, text="데이터 불러오는 중...")
-        p, v, bms, succ, fail = fetch_data_serial(ALL_STOCKS, s_d, e_d)
+        p, v, bms, succ, fail = fetch_data_pykrx(ALL_STOCKS, s_d, e_d)
         
         if not p.empty:
             prog_bar.progress(0.2, text="시뮬레이션 준비 완료...")
