@@ -1,45 +1,58 @@
 import streamlit as st
+import sys
+import subprocess
+import time
+import logging
+
+# ==============================================================================
+# [🚨 긴급 복구 모드] 라이브러리 강제 설치 (가장 먼저 실행됨)
+# ==============================================================================
+def install_package(package_name):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+
+try:
+    # 1. 기초 공사 도구 (setuptools) 먼저 확인
+    import pkg_resources
+except ImportError:
+    # 없으면 즉시 설치 (화면에 아무것도 안 띄우고 조용히 설치)
+    install_package("setuptools")
+
+try:
+    # 2. 핵심 라이브러리 (pykrx) 확인
+    import pykrx
+    USE_PYKRX = True
+except ImportError:
+    # 없으면 안내 메시지 띄우고 설치 시작
+    placeholder = st.empty()
+    placeholder.warning("⚠️ 필수 라이브러리(pykrx) 설치 중입니다... (약 30초 소요)")
+    
+    try:
+        install_package("setuptools") # 혹시 몰라 한 번 더
+        install_package("finance-datareader")
+        install_package("plotly")
+        install_package("pykrx")
+        
+        placeholder.success("✅ 설치 완료! 앱을 새로고침합니다.")
+        time.sleep(1)
+        st.rerun() # 설치 후 즉시 재시작
+    except Exception as e:
+        st.error(f"❌ 설치 중 치명적 오류 발생: {e}")
+        st.stop()
+
+# ==============================================================================
+# [정상 진입] 라이브러리 로딩 (설치가 끝난 후 안전하게 import)
+# ==============================================================================
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
-import logging
-import time
-import sys
-import subprocess
-
-# [비기] 라이브러리 강제 설치 함수
-def install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-# pykrx 불러오기 시도 -> 실패하면 즉시 설치 -> 다시 불러오기
-try:
-    from pykrx import stock
-    USE_PYKRX = True
-except ImportError:
-    try:
-        # 화면에 설치 중임을 표시
-        with st.spinner("⚠️ 필수 라이브러리(setuptools, pykrx) 설치 중... (약 30초 소요)"):
-            # [핵심] setuptools 먼저 설치 (pkg_resources 에러 해결)
-            install("setuptools") 
-            install("finance-datareader")
-            install("pykrx")
-            
-            from pykrx import stock
-            
-        st.success("✅ 설치가 완료되었습니다! 앱이 곧 실행됩니다.")
-        USE_PYKRX = True
-        time.sleep(1) # 메시지 보여줄 시간 확보
-        st.rerun() # 새로고침해서 라이브러리 로드
-    except Exception as e:
-        st.error(f"❌ 설치 실패: {e}")
-        st.stop()
+from pykrx import stock # 이제 안전하게 로딩 가능
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (v10.0 Pykrx)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v10.1)", layout="wide", initial_sidebar_state="expanded")
 
 # --- [스타일링] ---
 st.markdown("""
@@ -133,35 +146,24 @@ def infer_sector_kr(name, code=None):
 @st.cache_data(ttl=3600*12)
 def load_kr_data_pykrx():
     try:
-        # [최적화] 오늘 기준 시가총액 상위 종목을 한 번에 가져옴 (속도 매우 빠름)
         today = datetime.now().strftime("%Y%m%d")
-        # 장이 안 열린 날일 수 있으니 최근 평일 탐색
         for _ in range(5):
             try:
-                # KOSPI + KOSDAQ 시가총액 데이터
                 df_kospi = stock.get_market_cap(today, market="KOSPI")
                 df_kosdaq = stock.get_market_cap(today, market="KOSDAQ")
-                
                 if not df_kospi.empty:
                     break
             except:
                 today = (datetime.strptime(today, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
         
-        # 합치기
         df_total = pd.concat([df_kospi, df_kosdaq])
-        
-        # 시가총액 상위 300개 선정
         df_top300 = df_total.sort_values(by='시가총액', ascending=False).head(300)
         
-        # 종목명 딕셔너리 생성 (pykrx는 데이터프레임 인덱스가 티커임)
-        # 005930 -> 삼성전자
         ticker_dict = {}
         top_codes = []
-        
         for code in df_top300.index:
             try:
                 name = stock.get_market_ticker_name(code)
-                # 스팩, 우선주 제외
                 if any(x in name for x in ['스팩', '우', '우B', '리츠', '홀딩스']):
                     continue
                 ticker_dict[code] = name
@@ -176,8 +178,6 @@ def load_kr_data_pykrx():
 
 @st.cache_data(ttl=3600*24)
 def fetch_data_pykrx(universe, start_date, end_date):
-    # 날짜 포맷 변환 (pykrx는 YYYYMMDD 문자열 필요)
-    # 데이터를 넉넉히 가져옴 (이평선 계산 등 위해)
     real_start = start_date - timedelta(days=400)
     s_str = real_start.strftime("%Y%m%d")
     e_str = end_date.strftime("%Y%m%d")
@@ -187,32 +187,24 @@ def fetch_data_pykrx(universe, start_date, end_date):
     success_count = 0
     fail_count = 0
     
-    # 1. 벤치마크 (KOSPI 지수)
     bm_dict = {}
     try:
-        # 1001: 코스피 지수
         kospi_df = stock.get_index_ohlcv_by_date(s_str, e_str, "1001")
         bm_dict['KOSPI'] = kospi_df['종가']
-    except:
-        pass
+    except: pass
 
-    # 2. 개별 종목 데이터
     progress_bar = st.progress(0, text="KRX 데이터 수집 중... (0%)")
     total = len(universe)
     
     for i, code in enumerate(universe):
         fetched = False
         try:
-            # pykrx는 '종가', '거래량' 등의 한글 컬럼을 반환함
             df = stock.get_market_ohlcv_by_date(s_str, e_str, code)
-            
-            # 수정주가 적용 (pykrx는 기본적으로 수정주가 반영됨)
             if not df.empty and len(df) > 60:
                 p_dict[code] = df['종가']
                 v_dict[code] = df['거래량']
                 fetched = True
-        except:
-            pass
+        except: pass
             
         if fetched: success_count += 1
         else: fail_count += 1
@@ -225,12 +217,10 @@ def fetch_data_pykrx(universe, start_date, end_date):
     df_p = pd.DataFrame(p_dict)
     df_v = pd.DataFrame(v_dict)
     
-    # 인덱스(날짜) 통일 및 빈 구멍 채우기
     if not df_p.empty:
         full_idx = pd.date_range(start=df_p.index.min(), end=df_p.index.max(), freq='B')
         df_p = df_p.reindex(full_idx).ffill()
         df_v = df_v.reindex(full_idx).fillna(0)
-        
         if 'KOSPI' in bm_dict:
             bm_dict['KOSPI'] = bm_dict['KOSPI'].reindex(full_idx).ffill()
             
@@ -241,7 +231,6 @@ def fetch_data_pykrx(universe, start_date, end_date):
 # ==============================================================================
 def calculate_factors(price, volume, min_amt, trading_days=252):
     if len(price) < 120 or price.iloc[-1] == 0 or np.isnan(price.iloc[-1]): return None
-    
     zero_volume_days = (volume.tail(20) == 0).sum()
     if zero_volume_days >= 3: return None 
 
@@ -462,7 +451,7 @@ def calculate_metrics(res_df):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (v10.0 Pykrx Edition)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v10.1)")
 
 def reset_results():
     st.session_state['bt_ran'] = False
@@ -489,8 +478,11 @@ with c_d2:
 
 with st.sidebar:
     st.info("대상: KOSPI/KOSDAQ 시가총액 상위 300개 (pykrx Source)")
-    # pykrx 로더 호출
-    TICKER_INFO, ALL_STOCKS = load_kr_data_pykrx()
+    # [복구] 안전하게 로딩 호출
+    if 'USE_PYKRX' in globals() and USE_PYKRX:
+        TICKER_INFO, ALL_STOCKS = load_kr_data_pykrx()
+    else:
+        TICKER_INFO, ALL_STOCKS = {}, []
             
     if st.button("🧹 캐시 초기화", key="clear_cache"): st.cache_data.clear(); st.rerun()
     st.divider()
@@ -524,7 +516,6 @@ if mode == "📉 백테스트":
         }
 
         prog_bar = st.progress(0, text="데이터 불러오는 중...")
-        # pykrx 페처 호출
         p, v, bms, succ, fail = fetch_data_pykrx(ALL_STOCKS, s_d, e_d)
         
         st.caption(f"📊 데이터 수집 결과: 성공 {succ}개 / 실패 {fail}개")
