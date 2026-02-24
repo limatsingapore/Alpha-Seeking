@@ -19,10 +19,14 @@ try:
 except ImportError:
     try:
         # 화면에 설치 중임을 표시
-        with st.spinner("⚠️ pykrx 라이브러리 설치 중... (약 15~30초 소요)"):
+        with st.spinner("⚠️ 필수 라이브러리(setuptools, pykrx) 설치 중... (약 30초 소요)"):
+            # [핵심] setuptools 먼저 설치 (pkg_resources 에러 해결)
+            install("setuptools") 
+            install("finance-datareader")
             install("pykrx")
-            install("finance-datareader") # 혹시 몰라 같이 설치
+            
             from pykrx import stock
+            
         st.success("✅ 설치가 완료되었습니다! 앱이 곧 실행됩니다.")
         USE_PYKRX = True
         time.sleep(1) # 메시지 보여줄 시간 확보
