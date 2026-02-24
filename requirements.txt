@@ -5,3 +5,4 @@ plotly
 finance-datareader
 pykrx>=1.0.40
 requests
+lxml
