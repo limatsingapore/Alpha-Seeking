@@ -1,58 +1,24 @@
 import streamlit as st
-import sys
-import subprocess
-import time
-import logging
-
-# ==============================================================================
-# [🚨 긴급 복구 모드] 라이브러리 강제 설치 (가장 먼저 실행됨)
-# ==============================================================================
-def install_package(package_name):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
-
-try:
-    # 1. 기초 공사 도구 (setuptools) 먼저 확인
-    import pkg_resources
-except ImportError:
-    # 없으면 즉시 설치 (화면에 아무것도 안 띄우고 조용히 설치)
-    install_package("setuptools")
-
-try:
-    # 2. 핵심 라이브러리 (pykrx) 확인
-    import pykrx
-    USE_PYKRX = True
-except ImportError:
-    # 없으면 안내 메시지 띄우고 설치 시작
-    placeholder = st.empty()
-    placeholder.warning("⚠️ 필수 라이브러리(pykrx) 설치 중입니다... (약 30초 소요)")
-    
-    try:
-        install_package("setuptools") # 혹시 몰라 한 번 더
-        install_package("finance-datareader")
-        install_package("plotly")
-        install_package("pykrx")
-        
-        placeholder.success("✅ 설치 완료! 앱을 새로고침합니다.")
-        time.sleep(1)
-        st.rerun() # 설치 후 즉시 재시작
-    except Exception as e:
-        st.error(f"❌ 설치 중 치명적 오류 발생: {e}")
-        st.stop()
-
-# ==============================================================================
-# [정상 진입] 라이브러리 로딩 (설치가 끝난 후 안전하게 import)
-# ==============================================================================
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
-from pykrx import stock # 이제 안전하게 로딩 가능
+import logging
+import time
 
 # --- [로그 설정] ---
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 
 # --- [페이지 설정] ---
-st.set_page_config(page_title="Alpha Seeking Pro (Final v10.1)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Alpha Seeking Pro (Final v10.3)", layout="wide", initial_sidebar_state="expanded")
+
+# [라이브러리 로딩]
+try:
+    from pykrx import stock
+    USE_PYKRX = True
+except ImportError:
+    st.error("❌ 라이브러리 로딩 실패. 1) Python 버전을 3.10으로 설정했는지, 2) requirements.txt에 pykrx와 setuptools가 있는지 확인해주세요.")
+    st.stop()
 
 # --- [스타일링] ---
 st.markdown("""
@@ -451,7 +417,7 @@ def calculate_metrics(res_df):
 # ==============================================================================
 # [UI MAIN]
 # ==============================================================================
-st.title("🇰🇷 Alpha Seeking Pro (Final v10.1)")
+st.title("🇰🇷 Alpha Seeking Pro (Final v10.3)")
 
 def reset_results():
     st.session_state['bt_ran'] = False
@@ -478,7 +444,7 @@ with c_d2:
 
 with st.sidebar:
     st.info("대상: KOSPI/KOSDAQ 시가총액 상위 300개 (pykrx Source)")
-    # [복구] 안전하게 로딩 호출
+    # pykrx 로더 호출
     if 'USE_PYKRX' in globals() and USE_PYKRX:
         TICKER_INFO, ALL_STOCKS = load_kr_data_pykrx()
     else:
