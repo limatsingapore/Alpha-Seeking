@@ -3,4 +3,5 @@ pandas
 numpy
 plotly
 finance-datareader
-pykrx
+pykrx>=1.0.40
+requests
