@@ -113,16 +113,33 @@ def infer_sector_kr(name, code=None):
 @st.cache_data(ttl=3600*12)
 def load_kr_data_pykrx():
     try:
-        today = datetime.now().strftime("%Y%m%d")
-        for _ in range(5):
-            try:
-                df_kospi = stock.get_market_cap(today, market="KOSPI")
-                df_kosdaq = stock.get_market_cap(today, market="KOSDAQ")
-                if not df_kospi.empty:
-                    break
-            except:
-                today = (datetime.strptime(today, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        # [수정 1] 변수 미리 선언 (에러 방지)
+        df_kospi = pd.DataFrame()
+        df_kosdaq = pd.DataFrame()
         
+        today = datetime.now().strftime("%Y%m%d")
+        
+        # 최근 7일(휴장일 고려 넉넉하게) 동안 시도
+        for _ in range(7):
+            try:
+                temp_kospi = stock.get_market_cap(today, market="KOSPI")
+                temp_kosdaq = stock.get_market_cap(today, market="KOSDAQ")
+                
+                if not temp_kospi.empty and not temp_kosdaq.empty:
+                    df_kospi = temp_kospi
+                    df_kosdaq = temp_kosdaq
+                    break # 성공하면 루프 탈출
+            except:
+                pass # 실패하면 그냥 넘어가고 날짜 하루 뺌
+                
+            today = (datetime.strptime(today, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        
+        # [수정 2] 끝까지 못 가져왔을 경우 대비 (안전장치)
+        if df_kospi.empty or df_kosdaq.empty:
+            st.warning("⚠️ 최근 시장 데이터를 가져오지 못했습니다. (삼성전자로 대체)")
+            return {"005930":"삼성전자"}, ["005930"]
+        
+        # 정상 로직 진행
         df_total = pd.concat([df_kospi, df_kosdaq])
         df_top300 = df_total.sort_values(by='시가총액', ascending=False).head(300)
         
@@ -140,6 +157,7 @@ def load_kr_data_pykrx():
         return ticker_dict, top_codes
 
     except Exception as e:
+        # 최후의 안전장치
         st.error(f"pykrx 종목 로딩 실패: {e}")
         return {"005930":"삼성전자"}, ["005930"]
 
